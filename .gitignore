@@ -6,3 +6,21 @@ venv/
 uploads/*
 !uploads/.gitkeep
 dist/
+# Application secrets & certificates
+*.pem
+*.key
+.env
+backend/.env
+
+# Node backend/frontend dependencies
+node_modules/
+package-lock.json
+
+# Logs and databases
+*.log
+*.db
+*.sqlite
+
+# User Uploads
+backend/uploads/*
+!backend/uploads/.gitkeep
