@@ -1,0 +1,206 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  margin: 0;
+  font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+}
+
+#root {
+  height: 100vh;
+}
+
+/* ─── LIGHT THEME (default) ──────────────────────────────────────────────── */
+:root,
+[data-theme="light"] {
+  --bg-page: #E5DDD5;
+  --bg-sidebar: #F0F2F5;
+  --bg-sidebar-header: #F0F2F5;
+  --bg-input-bar: #F0F2F5;
+  --bg-bubble-sent: #D9FDD3;
+  --bg-bubble-received: #FFFFFF;
+  --text-primary: #111B21;
+  --text-secondary: #667781;
+  --text-muted: #8696A0;
+  --border-color: #E9EDEF;
+  --shadow-sm: 0 1px 2px rgba(0,0,0,0.08);
+}
+
+/* ─── DARK THEME ─────────────────────────────────────────────────────────── */
+[data-theme="dark"] {
+  --bg-page: #0B141A;
+  --bg-sidebar: #111B21;
+  --bg-sidebar-header: #202C33;
+  --bg-input-bar: #202C33;
+  --bg-bubble-sent: #005C4B;
+  --bg-bubble-received: #202C33;
+  --text-primary: #E9EDEF;
+  --text-secondary: #8696A0;
+  --text-muted: #667781;
+  --border-color: #313D45;
+  --shadow-sm: 0 1px 2px rgba(0,0,0,0.3);
+}
+
+/* Apply theme variables */
+body {
+  background-color: var(--bg-page);
+  color: var(--text-primary);
+}
+
+/* ─── CHAT BACKGROUND ──────────────────────────────────────────────────── */
+.chat-bg {
+  background-color: var(--bg-page);
+  background-image: url("data:image/svg+xml,%3Csvg width='60' height='60' viewBox='0 0 60 60' xmlns='http://www.w3.org/2000/svg'%3E%3Cg fill='none' fill-rule='evenodd'%3E%3Cg fill='%23ffffff' fill-opacity='0.4'%3E%3Cpath d='M36 34v-4h-2v4h-4v2h4v4h2v-4h4v-2h-4zm0-30V0h-2v4h-4v2h4v4h2V6h4V4h-4zM6 34v-4H4v4H0v2h4v4h2v-4h4v-2H6zM6 4V0H4v4H0v2h4v4h2V6h4V4H6z'/%3E%3C/g%3E%3C/g%3E%3C/svg%3E");
+}
+
+[data-theme="dark"] .chat-bg {
+  background-image: url("data:image/svg+xml,%3Csvg width='60' height='60' viewBox='0 0 60 60' xmlns='http://www.w3.org/2000/svg'%3E%3Cg fill='none' fill-rule='evenodd'%3E%3Cg fill='%23111B21' fill-opacity='0.4'%3E%3Cpath d='M36 34v-4h-2v4h-4v2h4v4h2v-4h4v-2h-4zm0-30V0h-2v4h-4v2h4v4h2V6h4V4h-4zM6 34v-4H4v4H0v2h4v4h2v-4h4v-2H6zM6 4V0H4v4H0v2h4v4h2V6h4V4H6z'/%3E%3C/g%3E%3C/g%3E%3C/svg%3E");
+}
+
+/* ─── BUBBLES ──────────────────────────────────────────────────────────── */
+.sent-bubble {
+  @apply rounded-lg px-3 py-2 max-w-[75%] shadow-sm relative;
+  background-color: var(--bg-bubble-sent);
+  color: var(--text-primary);
+}
+
+.received-bubble {
+  @apply rounded-lg px-3 py-2 max-w-[75%] shadow-sm relative;
+  background-color: var(--bg-bubble-received);
+  color: var(--text-primary);
+}
+
+/* ─── TYPING INDICATOR ─────────────────────────────────────────────────── */
+.typing-dot {
+  @apply w-2 h-2 rounded-full;
+  background-color: var(--text-muted);
+  animation: bounce 1.2s infinite;
+}
+
+.typing-dot:nth-child(2) {
+  animation-delay: 0.1s;
+}
+
+.typing-dot:nth-child(3) {
+  animation-delay: 0.2s;
+}
+
+@keyframes bounce {
+  0%, 60%, 100% { transform: translateY(0); }
+  30% { transform: translateY(-4px); }
+}
+
+/* ─── VOICE WAVEFORM ───────────────────────────────────────────────────── */
+.voice-waveform {
+  border-radius: 8px;
+  background: rgba(37, 211, 102, 0.08);
+}
+
+/* ─── MESSAGE SLIDE-IN ANIMATION ───────────────────────────────────────── */
+.msg-enter {
+  animation: slideIn 0.25s ease-out both;
+}
+
+@keyframes slideIn {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+/* ─── TYPING FADE ──────────────────────────────────────────────────────── */
+.typing-fade {
+  animation: fadeIn 0.3s ease-out both;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; max-height: 0; }
+  to { opacity: 1; max-height: 40px; }
+}
+
+/* ─── SIDEBAR SLIDE (mobile) ───────────────────────────────────────────── */
+.sidebar-overlay {
+  display: none;
+}
+
+@media (max-width: 768px) {
+  .sidebar-panel {
+    position: fixed;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: 100% !important;
+    z-index: 40;
+    transform: translateX(-100%);
+    transition: transform 0.3s ease;
+    min-width: unset !important;
+  }
+
+  .sidebar-panel.open {
+    transform: translateX(0);
+  }
+
+  .sidebar-overlay {
+    display: block;
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.4);
+    z-index: 30;
+  }
+
+  .sidebar-overlay.hidden {
+    display: none;
+  }
+
+  .chat-area {
+    width: 100%;
+  }
+}
+
+/* ─── SCROLLBAR ────────────────────────────────────────────────────────── */
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background-color: var(--text-muted);
+  border-radius: 3px;
+}
+
+/* ─── DARK OVERRIDES FOR TAILWIND UTILITY CLASSES ──────────────────────── */
+[data-theme="dark"] .bg-white {
+  background-color: var(--bg-sidebar);
+}
+[data-theme="dark"] .bg-gray-100 {
+  background-color: var(--bg-sidebar-header);
+}
+[data-theme="dark"] .border-gray-200,
+[data-theme="dark"] .border-gray-100 {
+  border-color: var(--border-color);
+}
+[data-theme="dark"] .text-gray-500,
+[data-theme="dark"] .text-gray-400 {
+  color: var(--text-secondary);
+}
+[data-theme="dark"] .text-gray-600 {
+  color: var(--text-muted);
+}
+[data-theme="dark"] .text-gray-900 {
+  color: var(--text-primary);
+}
+[data-theme="dark"] .hover\:bg-gray-50:hover {
+  background-color: var(--bg-sidebar-header);
+}
+[data-theme="dark"] .hover\:bg-gray-200:hover {
+  background-color: #2A3942;
+}
+[data-theme="dark"] .bg-gray-50 {
+  background-color: var(--bg-sidebar-header);
+}

@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+websockets
+asyncpg
+sqlalchemy[asyncio]
+python-dotenv
+python-jose[cryptography]
+cryptography
+passlib[bcrypt]
+python-multipart
+aiofiles
+zeroconf
+qrcode[pil]
+Pillow

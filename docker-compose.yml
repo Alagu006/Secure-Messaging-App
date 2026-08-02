@@ -1,0 +1,67 @@
+version: "3.9"
+
+# ─── LANChat ───────────────────────────────────────────────────────────────
+# Start everything with one command:
+#   docker-compose up
+#
+# This starts:
+#   1. PostgreSQL database (port 5432)
+#   2. FastAPI backend server (port 8000)
+#
+# The frontend (React/Vite) should be run separately with:
+#   cd frontend && npm run dev
+#
+# Or you can build it and serve from the backend with a static mount.
+
+services:
+  # ── Database ──────────────────────────────────────────────────────────────
+  db:
+    image: postgres:16-alpine
+    container_name: lanchat-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: lanchat
+      POSTGRES_PASSWORD: lanchat
+      POSTGRES_DB: lanchat
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lanchat"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ── Backend ───────────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile_inline: |
+        FROM python:3.11-slim
+        WORKDIR /app
+        COPY requirements.txt .
+        RUN pip install --no-cache-dir -r requirements.txt
+        COPY . .
+        EXPOSE 8000
+        CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+    container_name: lanchat-backend
+    restart: unless-stopped
+    ports:
+      - "443:8000"
+      - "8000:8000"
+    environment:
+      DB_URL: postgresql://lanchat:lanchat@db:5432/lanchat
+      SECRET_KEY: change-me-to-a-random-secret
+      HOST: "0.0.0.0"
+      PORT: "8000"
+      SSL_CERTFILE: certs/cert.pem
+      SSL_KEYFILE: certs/key.pem
+    volumes:
+      - ./backend/certs:/app/certs
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
