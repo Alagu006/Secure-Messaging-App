@@ -1,5 +1,6 @@
 import { useState, useCallback, useRef, useEffect } from "react";
 import { cacheMessages, getCachedMessages } from "../utils/messageCache";
+import { getApiUrl } from "../utils/serverConfig";
 
 /*
   Network transport: since the server doesn't handle IV separately,
@@ -60,20 +61,53 @@ export function useMessages(ws, encryption, currentUserId, users, keyPair) {
     const handleNewMessage = async (data) => {
       const senderId = data.sender_id;
       const isFromMe = senderId === currentUserId;
-      const otherId = isFromMe ? data.recipient_id : senderId;
+      // Feature 4: Check group_id first so group messages are filed under the group's conversation ID
+      const isGroup = !!data.group_id;
+      const convId = isGroup ? data.group_id : (isFromMe ? data.recipient_id : senderId);
+      const otherId = convId;
+
+      // Handle group session key distribution
+      if (data.message_type === "group_key_bundle") {
+        try {
+          const sender = userMap.current[senderId];
+          if (sender?.public_key && encryption?.unwrapAndStoreGroupKey) {
+            await encryption.unwrapAndStoreGroupKey(
+              data.group_id,
+              sender.public_key,
+              data.ciphertext,
+              currentUserId
+            );
+          }
+        } catch (err) {
+          console.error("Failed to unwrap group key bundle:", err);
+        }
+        return; // Key bundles are protocol messages, not visible text
+      }
 
       // Attempt decryption
       let plaintext = "";
       let decryptFailed = false;
-      const otherUser = userMap.current[otherId];
-      if (otherUser && encryption) {
-        try {
-          const { iv, ciphertext } = unbundle(data.ciphertext);
-          if (!otherUser.public_key) throw new Error('Recipient public key not found');
-          plaintext = await encryption.decrypt(otherUser.public_key, iv, ciphertext);
-        } catch {
-          decryptFailed = true;
-          plaintext = "🔒 Encrypted message";
+      if (isGroup) {
+        if (encryption && data.ciphertext && !data.is_deleted) {
+          try {
+            const { iv, ciphertext } = unbundle(data.ciphertext);
+            plaintext = await encryption.decryptGroup(data.group_id, iv, ciphertext);
+          } catch {
+            decryptFailed = true;
+            plaintext = "🔒 Encrypted group message";
+          }
+        }
+      } else {
+        const otherUser = userMap.current[otherId];
+        if (otherUser && encryption && data.ciphertext && !data.is_deleted) {
+          try {
+            const { iv, ciphertext } = unbundle(data.ciphertext);
+            if (!otherUser.public_key) throw new Error('Recipient public key not found');
+            plaintext = await encryption.decrypt(otherUser.public_key, iv, ciphertext);
+          } catch {
+            decryptFailed = true;
+            plaintext = "🔒 Encrypted message";
+          }
         }
       }
 
@@ -94,6 +128,7 @@ export function useMessages(ws, encryption, currentUserId, users, keyPair) {
         id: data.id,
         senderId,
         otherId,
+        groupId: data.group_id || null,
         plaintext,
         ciphertext: data.ciphertext,
         messageType: data.message_type || "text",
@@ -111,7 +146,6 @@ export function useMessages(ws, encryption, currentUserId, users, keyPair) {
       };
 
       // Update messages
-      const convId = otherId;
       const prev = messagesByConvRef.current[convId] || [];
       const updated = [...prev, msg];
       messagesByConvRef.current[convId] = updated;
@@ -119,7 +153,7 @@ export function useMessages(ws, encryption, currentUserId, users, keyPair) {
       cacheMessages(convId, [msg]);
 
       // Update conversation list
-      updateConversationList(otherId, msg, isFromMe);
+      updateConversationList(convId, msg, isFromMe, isGroup);
 
       // Unread count (only for received messages in non-active conv)
       if (!isFromMe) {
@@ -241,6 +275,18 @@ export function useMessages(ws, encryption, currentUserId, users, keyPair) {
     const handleGroupCreated = (data) => {
       // Add a conversation entry for this group
       const groupConvId = data.id;
+      if (data.key_bundle && encryption?.unwrapAndStoreGroupKey) {
+        const creator = userMap.current[data.created_by];
+        if (creator?.public_key) {
+          encryption.unwrapAndStoreGroupKey(
+            groupConvId,
+            creator.public_key,
+            data.key_bundle,
+            currentUserId
+          ).catch((err) => console.error("Failed to unwrap key bundle on group_created:", err));
+        }
+      }
+
       setConversations((prev) => {
         if (prev.find((c) => c.userId === groupConvId)) return prev;
         return [...prev, {
@@ -248,11 +294,42 @@ export function useMessages(ws, encryption, currentUserId, users, keyPair) {
           username: data.name,
           isGroup: true,
           memberIds: data.members,
+          createdBy: data.created_by,
           lastMessage: "Group created",
           lastTime: new Date().toISOString(),
           isOnline: false,
         }];
       });
+    };
+
+    const handleMemberLeft = (data) => {
+      const { group_id, user_id } = data;
+      if (user_id === currentUserId) {
+        setConversations((prev) => prev.filter((c) => c.userId !== group_id));
+      } else {
+        setConversations((prev) =>
+          prev.map((c) =>
+            c.userId === group_id && c.memberIds
+              ? { ...c, memberIds: c.memberIds.filter((id) => id !== user_id) }
+              : c
+          )
+        );
+      }
+    };
+
+    const handleMemberRemoved = (data) => {
+      const { group_id, user_id } = data;
+      if (user_id === currentUserId) {
+        setConversations((prev) => prev.filter((c) => c.userId !== group_id));
+      } else {
+        setConversations((prev) =>
+          prev.map((c) =>
+            c.userId === group_id && c.memberIds
+              ? { ...c, memberIds: c.memberIds.filter((id) => id !== user_id) }
+              : c
+          )
+        );
+      }
     };
 
     ws.on("new_message", handleNewMessage);
@@ -267,6 +344,8 @@ export function useMessages(ws, encryption, currentUserId, users, keyPair) {
     ws.on("typing_indicator", handleTypingIndicator);
     ws.on("pong", handlePong);
     ws.on("group_created", handleGroupCreated);
+    ws.on("member_left", handleMemberLeft);
+    ws.on("member_removed", handleMemberRemoved);
 
     return () => {
       ws.off("new_message");
@@ -281,6 +360,8 @@ export function useMessages(ws, encryption, currentUserId, users, keyPair) {
       ws.off("typing_indicator");
       ws.off("pong");
       ws.off("group_created");
+      ws.off("member_left");
+      ws.off("member_removed");
     };
   }, [ws, encryption, currentUserId, users]);
 
@@ -306,7 +387,11 @@ export function useMessages(ws, encryption, currentUserId, users, keyPair) {
     }
 
     try {
-      let url = `/messages/${otherUserId}?limit=50`;
+      const isGroup = conversations.find((c) => c.userId === otherUserId)?.isGroup || false;
+      const apiBase = getApiUrl();
+      let url = isGroup
+        ? `${apiBase}/messages/group/${otherUserId}?limit=50`
+        : `${apiBase}/messages/${otherUserId}?limit=50`;
       if (beforeId) url += `&before_id=${beforeId}`;
       const resp = await fetch(url, {
         headers: { Authorization: `Bearer ${token}` },
@@ -317,18 +402,55 @@ export function useMessages(ws, encryption, currentUserId, users, keyPair) {
       // Track whether there are more pages
       hasMoreRef.current[otherUserId] = msgs.length >= 50;
 
+      // If group, unwrap any group key bundles in history first so messages can decrypt
+      if (isGroup && encryption?.unwrapAndStoreGroupKey) {
+        for (const m of msgs) {
+          if (m.message_type === "group_key_bundle") {
+            try {
+              const sender = userMap.current[m.sender_id];
+              if (sender?.public_key) {
+                await encryption.unwrapAndStoreGroupKey(
+                  otherUserId,
+                  sender.public_key,
+                  m.ciphertext,
+                  currentUserId
+                );
+              }
+            } catch (err) {
+              console.error("Failed to unwrap group key bundle from history:", err);
+            }
+          }
+        }
+      }
+
       const decrypted = [];
       for (const m of msgs) {
+        // Skip group key bundles from visible messages list
+        if (m.message_type === "group_key_bundle") continue;
+
         let plaintext = "";
         let decryptFailed = false;
-        const otherUser = userMap.current[otherUserId];
-        if (otherUser && encryption && m.ciphertext && !m.is_deleted) {
-          try {
-            const { iv, ciphertext } = unbundle(m.ciphertext);
-            plaintext = await encryption.decrypt(otherUser.public_key, iv, ciphertext);
-          } catch {
-            decryptFailed = true;
-            plaintext = "🔒 Encrypted message";
+
+        if (isGroup) {
+          if (encryption && m.ciphertext && !m.is_deleted) {
+            try {
+              const { iv, ciphertext } = unbundle(m.ciphertext);
+              plaintext = await encryption.decryptGroup(otherUserId, iv, ciphertext);
+            } catch {
+              decryptFailed = true;
+              plaintext = "🔒 Encrypted group message";
+            }
+          }
+        } else {
+          const otherUser = userMap.current[otherUserId];
+          if (otherUser && encryption && m.ciphertext && !m.is_deleted) {
+            try {
+              const { iv, ciphertext } = unbundle(m.ciphertext);
+              plaintext = await encryption.decrypt(otherUser.public_key, iv, ciphertext);
+            } catch {
+              decryptFailed = true;
+              plaintext = "🔒 Encrypted message";
+            }
           }
         }
 
@@ -350,6 +472,7 @@ export function useMessages(ws, encryption, currentUserId, users, keyPair) {
           id: m.id,
           senderId: m.sender_id,
           otherId: otherUserId,
+          groupId: m.group_id || null,
           plaintext: m.is_deleted ? "" : plaintext,
           ciphertext: m.ciphertext,
           messageType: m.message_type || "text",
@@ -394,28 +517,38 @@ export function useMessages(ws, encryption, currentUserId, users, keyPair) {
     }
   }
 
-  function updateConversationList(otherId, msg, isFromMe) {
+  function updateConversationList(convId, msg, isFromMe, isGroup = false) {
     setConversations((prev) => {
-      const user = userMap.current[otherId];
+      const existing = prev.find((c) => c.userId === convId);
+      if (isGroup || existing?.isGroup) {
+        if (!existing) return prev;
+        const entry = {
+          ...existing,
+          lastMessage: msg.plaintext || (msg.isDeleted ? "Message deleted" : ""),
+          lastTime: msg.createdAt,
+        };
+        return prev.map((c) => (c.userId === convId ? entry : c));
+      }
+
+      const user = userMap.current[convId];
       if (!user) return prev;
-      const existing = prev.find((c) => c.userId === otherId);
       const entry = {
-        userId: otherId,
+        userId: convId,
         username: user.username,
         publicKeyB64: user.public_key,
         lastMessage: msg.plaintext || (msg.isDeleted ? "Message deleted" : ""),
         lastTime: msg.createdAt,
-        isOnline: onlineUsers.has(otherId),
+        isOnline: onlineUsers.has(convId),
       };
       if (existing) {
-        return prev.map((c) => (c.userId === otherId ? entry : c));
+        return prev.map((c) => (c.userId === convId ? entry : c));
       }
       return [...prev, entry];
     });
   }
 
   const sendMessage = useCallback(
-    async (recipientId, recipientPublicKey, text, replyToId = null, messageType = "text", fileMeta = null) => {
+    async (targetId, recipientPublicKey, text, replyToId = null, messageType = "text", fileMeta = null, ttlSeconds = null, isGroup = false) => {
       if (!encryption || !ws) return;
       try {
         let payload = text;
@@ -423,18 +556,36 @@ export function useMessages(ws, encryption, currentUserId, users, keyPair) {
         if (fileMeta) {
           payload = JSON.stringify({ type: "file", file_id: fileMeta.fileId, name: fileMeta.name, mime: fileMeta.mime, size: fileMeta.size });
         }
-        const { iv, ciphertext } = await encryption.encrypt(
-          recipientPublicKey,
-          payload
-        );
-        ws.send("send_message", {
-          recipient_id: recipientId,
-          ciphertext: bundle(iv, ciphertext),
+
+        let bundledCiphertext;
+        if (isGroup) {
+          const { iv, ciphertext } = await encryption.encryptGroup(targetId, payload);
+          bundledCiphertext = bundle(iv, ciphertext);
+        } else {
+          const { iv, ciphertext } = await encryption.encrypt(
+            recipientPublicKey,
+            payload
+          );
+          bundledCiphertext = bundle(iv, ciphertext);
+        }
+
+        const msgPayload = {
+          ciphertext: bundledCiphertext,
           message_type: messageType,
           reply_to_id: replyToId,
-        });
+        };
+        if (isGroup) {
+          msgPayload.group_id = targetId;
+        } else {
+          msgPayload.recipient_id = targetId;
+        }
+        // Feature: Include TTL seconds for disappearing messages
+        if (ttlSeconds && ttlSeconds > 0) {
+          msgPayload.ttl_seconds = ttlSeconds;
+        }
+        ws.send("send_message", msgPayload);
       } catch (err) {
-        console.error("Encryption failed:", err);
+        console.error("Encryption or send failed:", err);
       }
     },
     [encryption, ws]
@@ -527,6 +678,52 @@ export function useMessages(ws, encryption, currentUserId, users, keyPair) {
     );
   }, [onlineUsers]);
 
+  // Feature: Client-side search across conversation history
+  const searchMessages = useCallback(
+    async (query, convId = null) => {
+      if (!query || !query.trim()) return [];
+      const q = query.trim().toLowerCase();
+
+      const candidateMap = new Map();
+      if (convId) {
+        const inMemory = messagesByConvRef.current[convId] || [];
+        inMemory.forEach((m) => { if (m && m.id) candidateMap.set(m.id, m); });
+        try {
+          const cached = await getCachedMessages(convId);
+          cached.forEach((m) => { if (m && m.id && !candidateMap.has(m.id)) candidateMap.set(m.id, m); });
+        } catch {}
+      } else {
+        Object.values(messagesByConvRef.current).forEach((msgs) => {
+          (msgs || []).forEach((m) => { if (m && m.id) candidateMap.set(m.id, m); });
+        });
+        for (const c of conversations) {
+          try {
+            const cached = await getCachedMessages(c.userId);
+            cached.forEach((m) => { if (m && m.id && !candidateMap.has(m.id)) candidateMap.set(m.id, m); });
+          } catch {}
+        }
+      }
+
+      const results = [];
+      for (const m of candidateMap.values()) {
+        const sender = userMap.current[m.senderId];
+        const senderName = (m.senderId === currentUserId ? "you" : sender?.username || "").toLowerCase();
+        const plaintext = (m.plaintext || "").toLowerCase();
+        const dateStr = m.createdAt ? new Date(m.createdAt).toLocaleDateString().toLowerCase() : "";
+        const timeStr = m.createdAt ? new Date(m.createdAt).toLocaleTimeString().toLowerCase() : "";
+
+        if (plaintext.includes(q) || senderName.includes(q) || dateStr.includes(q) || timeStr.includes(q)) {
+          results.push({
+            ...m,
+            senderName: m.senderId === currentUserId ? "You" : sender?.username || "Unknown",
+          });
+        }
+      }
+      return results;
+    },
+    [conversations, currentUserId]
+  );
+
   return {
     conversations,
     messagesByConv,
@@ -543,6 +740,7 @@ export function useMessages(ws, encryption, currentUserId, users, keyPair) {
     fetchHistory,
     historyFetchedRef,
     hasMoreRef,
+    searchMessages,
     bundle,
     unbundle,
   };

@@ -15,6 +15,7 @@ export default function SetupPage() {
 
   const [step, setStep] = useState(1);
   const [username, setUsername] = useState("");
+  const [inviteCode, setInviteCode] = useState("");
   const [passphrase, setPassphrase] = useState("");
   const [confirmPass, setConfirmPass] = useState("");
   const [keyPair, setKeyPair] = useState(null);
@@ -31,6 +32,7 @@ export default function SetupPage() {
 
   const handleGenerate = async () => {
     if (!username.trim()) { setError("Pick a username"); return; }
+    if (!inviteCode.trim()) { setError("Invite code required"); return; }
     if (passphrase.length < 8) { setError("Passphrase must be 8+ characters"); return; }
     if (passphrase !== confirmPass) { setError("Passphrases don't match"); return; }
     setError("");
@@ -74,6 +76,7 @@ export default function SetupPage() {
           username: username.trim(),
           public_key: publicKeyB64,
           wrapped_keys: wrappedKeysB64,
+          invite_code: inviteCode.trim(),
         }),
       });
       if (!res.ok) {
@@ -121,6 +124,17 @@ export default function SetupPage() {
                   value={username}
                   onChange={(e) => setUsername(e.target.value)}
                   maxLength={30}
+                />
+              </div>
+
+              <div className="mb-4">
+                <label className="block text-sm font-medium text-gray-700 mb-1">Invite Code</label>
+                <input
+                  type="text"
+                  className="w-full border border-gray-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-whatsapp-green"
+                  placeholder="Enter organization invite code"
+                  value={inviteCode}
+                  onChange={(e) => setInviteCode(e.target.value)}
                 />
               </div>
 

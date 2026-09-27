@@ -18,6 +18,7 @@ DEPENDENCIES:
   pip install zeroconf qrcode[pil]
 """
 
+import os
 import socket
 
 from zeroconf import Zeroconf, ServiceInfo
@@ -62,6 +63,10 @@ class DiscoveryService:
 
     def start(self):
         """Register the LANChat service on the LAN."""
+        # Security fix: Check DISCOVERY_ENABLED to prevent leaking server presence on untrusted networks.
+        if os.getenv("DISCOVERY_ENABLED", "true").strip().lower() not in ("true", "1", "yes"):
+            return
+
         if self._zeroconf is not None:
             return  # already running
 
@@ -93,8 +98,9 @@ class DiscoveryService:
             if self._service_info:
                 self._zeroconf.unregister_service(self._service_info)
             self._zeroconf.close()
-        except Exception:
-            pass
+        except Exception as e:
+            # Security fix: Log cleanup error instead of silently discarding it.
+            print(f"[cleanup] ignored error: {e}")
         self._zeroconf = None
         print("[discovery] Stopped")
 

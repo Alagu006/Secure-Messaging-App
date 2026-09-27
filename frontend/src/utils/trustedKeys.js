@@ -51,6 +51,7 @@ export async function isKeyTrusted(userId) {
   return !!record;
 }
 
+// Security fix (TOFU trust gate): verifyAndTrust computes fingerprint but UI callers must explicitly require user confirmation out-of-band before calling saveTrustedKey().
 export async function verifyAndTrust(publicKeyB64, username, expectedUserId) {
   const { publicKey, signingPublicKey } = await importPublicKey(publicKeyB64);
   const fingerprint = await getKeyFingerprint(publicKey, signingPublicKey);

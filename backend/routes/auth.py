@@ -19,10 +19,13 @@ import time
 import secrets
 import base64
 import json
+import hmac
 
 from fastapi import APIRouter, HTTPException, Request, Header, Depends
 from pydantic import BaseModel
-from jose import jwt, JWTError
+# Security fix: Replace python-jose with PyJWT to avoid vulnerable non-constant-time ecdsa (PYSEC-2026-1325).
+import jwt
+from jwt.exceptions import PyJWTError as JWTError
 from datetime import datetime, timedelta
 
 from cryptography.hazmat.primitives.asymmetric.ec import SECP256R1, ECDSA
@@ -36,7 +39,10 @@ import database
 router = APIRouter(prefix="/auth")
 
 # ── JWT config ────────────────────────────────────────────────────────────
+# Security fix: Read SECRET_KEY with no default and fail loudly at startup if unset.
 SECRET_KEY = os.getenv("SECRET_KEY")
+if not SECRET_KEY:
+    raise RuntimeError("SECRET_KEY environment variable is not set")
 ALGORITHM = "HS256"
 # Tokens last 24 hours — adjust if you want shorter sessions
 TOKEN_EXPIRE_MINUTES = 60 * 24
@@ -91,9 +97,20 @@ async def get_current_user(authorization: str = Header(None)):
     token_value = authorization.split(" ")[1]
     try:
         payload = jwt.decode(token_value, SECRET_KEY, algorithms=[ALGORITHM])
-        return payload.get("sub"), payload.get("username")
+        user_id = payload.get("sub")
+        username = payload.get("username")
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
+
+    # Security fix: Verify user account is active after decoding JWT to reject disabled accounts.
+    async with database.pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT is_active FROM users WHERE id = $1::uuid", user_id
+        )
+    if not row or not row["is_active"]:
+        raise HTTPException(status_code=401, detail="Account disabled")
+
+    return user_id, username
 
 
 # ── Pydantic models (request/response schemas) ────────────────────────────
@@ -102,6 +119,7 @@ class RegisterRequest(BaseModel):
     username: str
     public_key: str  # base64-encoded Ed25519 public key bytes
     wrapped_keys: str | None = None  # encrypted private keys (JSON), optional
+    invite_code: str | None = None
 
 
 class ChallengeRequest(BaseModel):
@@ -130,6 +148,12 @@ async def register(body: RegisterRequest, request: Request):
     public key. The server stores it alongside the chosen username.
     """
     _check_reg_rate_limit(request.client.host)
+
+    # Security fix: Require valid invite code to prevent unauthorized account creation.
+    invite_code = os.getenv("INVITE_CODE")
+    if not invite_code or not body.invite_code or not hmac.compare_digest(body.invite_code.strip(), invite_code.strip()):
+        raise HTTPException(status_code=403, detail="Invalid or missing invite code")
+
     username = body.username.strip()
     if not username:
         raise HTTPException(status_code=400, detail="Username cannot be empty")
@@ -284,7 +308,8 @@ async def get_wrapped_keys(
     Returns the encrypted private key data so the client can unlock
     them with the passphrase on any device.
     """
-    username = body.username.strip()
+    # Security fix: Ignore body.username and use verified JWT username so users can only fetch their own wrapped keys.
+    _user_id, username = user_info
     async with database.pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT wrapped_keys FROM users WHERE username = $1", username
@@ -325,14 +350,94 @@ async def update_username(
     return {"username": new_username}
 
 
+def _is_admin(username: str) -> bool:
+    """Helper to check if a username has admin privileges."""
+    admin_env = os.getenv("ADMIN_USERNAMES", "")
+    admin_list = [u.strip() for u in admin_env.split(",") if u.strip()]
+    return username in admin_list
+
+
+@router.get("/is-admin")
+async def check_is_admin(user_info: tuple = Depends(get_current_user)):
+    """Return whether the current authenticated user has admin privileges."""
+    _user_id, username = user_info
+    return {"is_admin": _is_admin(username)}
+
+
+@router.get("/admin/users")
+async def admin_list_users(user_info: tuple = Depends(get_current_user)):
+    """Admin endpoint to list all users with their account status."""
+    _admin_id, admin_username = user_info
+    if not _is_admin(admin_username):
+        raise HTTPException(status_code=403, detail="Admin privileges required")
+
+    async with database.pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, username, is_active, created_at, last_seen FROM users ORDER BY created_at ASC"
+        )
+    return [
+        {
+            "id": str(r["id"]),
+            "username": r["username"],
+            "is_active": r["is_active"],
+            "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+            "last_seen": r["last_seen"].isoformat() if r["last_seen"] else None,
+        }
+        for r in rows
+    ]
+
+
+@router.patch("/users/{user_id}/disable")
+async def disable_user(
+    user_id: str,
+    user_info: tuple = Depends(get_current_user),
+):
+    """Admin-only endpoint to disable a user account."""
+    _admin_id, admin_username = user_info
+    # Security fix: Restrict account disabling to usernames configured in ADMIN_USERNAMES env var.
+    if not _is_admin(admin_username):
+        raise HTTPException(status_code=403, detail="Admin privileges required")
+
+    async with database.pool.acquire() as conn:
+        res = await conn.execute(
+            "UPDATE users SET is_active = false WHERE id = $1::uuid", user_id
+        )
+    if res == "UPDATE 0":
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return {"status": "success", "user_id": user_id, "is_active": False}
+
+
+@router.patch("/users/{user_id}/enable")
+async def enable_user(
+    user_id: str,
+    user_info: tuple = Depends(get_current_user),
+):
+    """Admin-only endpoint to re-enable a disabled user account."""
+    _admin_id, admin_username = user_info
+    # Security fix: Restrict account enabling to usernames configured in ADMIN_USERNAMES env var.
+    if not _is_admin(admin_username):
+        raise HTTPException(status_code=403, detail="Admin privileges required")
+
+    async with database.pool.acquire() as conn:
+        res = await conn.execute(
+            "UPDATE users SET is_active = true WHERE id = $1::uuid", user_id
+        )
+    if res == "UPDATE 0":
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return {"status": "success", "user_id": user_id, "is_active": True}
+
+
 @router.get("/users")
-async def list_users():
+async def list_users(user_info: tuple = Depends(get_current_user)):
     """Return every registered user and their public key.
 
     The client needs other users' public keys to encrypt messages
     before sending them. This endpoint makes key exchange possible
     without any out-of-band communication.
     """
+    # Security fix: Require valid JWT token before exposing registered user directory.
     async with database.pool.acquire() as conn:
         rows = await conn.fetch(
             "SELECT id, username, public_key, created_at, last_seen FROM users ORDER BY created_at ASC"

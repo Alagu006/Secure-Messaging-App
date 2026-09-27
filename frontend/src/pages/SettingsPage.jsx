@@ -19,6 +19,18 @@ export default function SettingsPage() {
   const [newUsername, setNewUsername] = useState(auth.username || "");
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState("");
+  const [isAdmin, setIsAdmin] = useState(false);
+
+  useEffect(() => {
+    if (auth.jwt) {
+      fetch(`${API()}/auth/is-admin`, {
+        headers: { Authorization: `Bearer ${auth.jwt}` },
+      })
+        .then((r) => r.json())
+        .then((data) => setIsAdmin(!!data.is_admin))
+        .catch(() => setIsAdmin(false));
+    }
+  }, [auth.jwt]);
 
   useEffect(() => {
     if (enc.identity) {
@@ -163,6 +175,18 @@ export default function SettingsPage() {
               Keys stored locally in IndexedDB — encrypted with your passphrase.
             </p>
           </div>
+
+          {/* Admin panel link */}
+          {isAdmin && (
+            <div className="mb-6">
+              <button
+                className="w-full bg-blue-600 text-white font-medium py-2.5 rounded-lg hover:bg-blue-700 transition flex items-center justify-center gap-2 shadow-sm"
+                onClick={() => nav("/admin")}
+              >
+                <span>🛡️ Open Admin Panel</span>
+              </button>
+            </div>
+          )}
 
           {/* Back button */}
           <button

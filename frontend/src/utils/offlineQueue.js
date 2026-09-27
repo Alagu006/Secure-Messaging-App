@@ -59,12 +59,15 @@ export async function enqueueMessage(msg) {
 
   await new Promise((resolve, reject) => {
     const req = store.add({
-      recipientId: msg.recipientId,
-      recipientPublicKey: msg.recipientPublicKey,
+      recipientId: msg.recipientId || null,
+      recipientPublicKey: msg.recipientPublicKey || null,
+      groupId: msg.groupId || null,
       ciphertext: msg.ciphertext,
       iv: msg.iv,
+      bundledCiphertext: msg.bundledCiphertext || (msg.iv && msg.ciphertext ? `${msg.iv}:${msg.ciphertext}` : msg.ciphertext),
       messageType: msg.messageType || "text",
       replyToId: msg.replyToId || null,
+      ttlSeconds: msg.ttlSeconds || null,
       queuedAt: Date.now(),
     });
     req.onsuccess = () => resolve();

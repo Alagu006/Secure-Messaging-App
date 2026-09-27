@@ -4,7 +4,8 @@ websockets
 asyncpg
 sqlalchemy[asyncio]
 python-dotenv
-python-jose[cryptography]
+# Security fix: Replace python-jose with pyjwt[crypto] to remove vulnerable ecdsa dependency (PYSEC-2026-1325).
+pyjwt[crypto]
 cryptography
 passlib[bcrypt]
 python-multipart

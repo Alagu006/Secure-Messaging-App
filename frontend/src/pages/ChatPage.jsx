@@ -74,8 +74,13 @@ export default function ChatPage() {
 
   // ── Group state ────────────────────────────────────────────────────────
   const [showCreateGroup, setShowCreateGroup] = useState(false);
+  const [showGroupModal, setShowGroupModal] = useState(false);
   const [groupName, setGroupName] = useState("");
   const [groupMembers, setGroupMembers] = useState([]);
+
+  // ── Disappearing messages & Search highlight state ─────────────────────
+  const [ttlSeconds, setTtlSeconds] = useState(0);
+  const [highlightedMsgId, setHighlightedMsgId] = useState(null);
 
   // ── WebRTC state ───────────────────────────────────────────────────────
   const [fileTransfers, setFileTransfers] = useState({});
@@ -154,17 +159,22 @@ export default function ChatPage() {
     (async () => {
       const pending = await drainQueue();
       for (const item of pending) {
-        msg.sendMessage(
-          item.recipientId,
-          item.recipientPublicKey,
-          item.plaintext || "Message",
-          item.replyToId
-        );
+        const bundled = item.bundledCiphertext || (item.iv && item.ciphertext ? `${item.iv}:${item.ciphertext}` : item.ciphertext);
+        if (bundled) {
+          ws.send("send_message", {
+            recipient_id: item.recipientId || null,
+            group_id: item.groupId || null,
+            ciphertext: bundled,
+            message_type: item.messageType || "text",
+            reply_to_id: item.replyToId || null,
+            ttl_seconds: item.ttlSeconds || null,
+          });
+        }
       }
       const count = await getQueueLength();
       setPendingCount(count);
     })();
-  }, [ws?.connected, msg]);
+  }, [ws?.connected, ws]);
 
   // Poll queue length periodically
   useEffect(() => {
@@ -207,27 +217,75 @@ export default function ChatPage() {
 
   const handleSend = async () => {
     if (!messageText.trim() || !activeConv) return;
-    const user = users.find((u) => u.id === activeConv);
-    if (!user) return;
 
-    if (!ws?.connected) {
-      // Offline — queue the message
-      try {
-        const { iv, ciphertext } = await enc.encrypt(user.public_key, messageText.trim());
-        await enqueueMessage({
-          recipientId: activeConv,
-          recipientPublicKey: user.public_key,
-          ciphertext,
-          iv,
-          plaintext: messageText.trim(),
-          messageType: "text",
-          replyToId: replyTo?.id || null,
-        });
-        setPendingCount((c) => c + 1);
-      } catch {}
+    // Bug 2 Fix: Check groups first instead of assuming activeConv is a user ID
+    const activeGroupConv = msg.conversations.find((c) => c.userId === activeConv && c.isGroup);
+    const isGroup = !!activeGroupConv;
+
+    if (isGroup) {
+      if (!ws?.connected) {
+        // Offline — queue the message with zero plaintext stored
+        try {
+          const { iv, ciphertext } = await enc.encryptGroup(activeConv, messageText.trim());
+          await enqueueMessage({
+            groupId: activeConv,
+            ciphertext,
+            iv,
+            bundledCiphertext: `${iv}:${ciphertext}`,
+            messageType: "text",
+            replyToId: replyTo?.id || null,
+            ttlSeconds: ttlSeconds || null,
+          });
+          setPendingCount((c) => c + 1);
+        } catch (err) {
+          console.error("Failed to queue group message:", err);
+        }
+      } else {
+        await msg.sendMessage(
+          activeConv,
+          null,
+          messageText.trim(),
+          replyTo?.id || null,
+          "text",
+          null,
+          ttlSeconds,
+          true
+        );
+      }
     } else {
-      await msg.sendMessage(activeConv, user.public_key, messageText.trim(), replyTo?.id || null);
+      const user = users.find((u) => u.id === activeConv);
+      if (!user) return;
+
+      if (!ws?.connected) {
+        // Bug 9 Fix: Offline queue stores only ciphertext and iv — never plaintext
+        try {
+          const { iv, ciphertext } = await enc.encrypt(user.public_key, messageText.trim());
+          await enqueueMessage({
+            recipientId: activeConv,
+            recipientPublicKey: user.public_key,
+            ciphertext,
+            iv,
+            bundledCiphertext: `${iv}:${ciphertext}`,
+            messageType: "text",
+            replyToId: replyTo?.id || null,
+            ttlSeconds: ttlSeconds || null,
+          });
+          setPendingCount((c) => c + 1);
+        } catch {}
+      } else {
+        await msg.sendMessage(
+          activeConv,
+          user.public_key,
+          messageText.trim(),
+          replyTo?.id || null,
+          "text",
+          null,
+          ttlSeconds,
+          false
+        );
+      }
     }
+
     setMessageText("");
     setReplyTo(null);
     setShowEmoji(false);
@@ -272,17 +330,23 @@ export default function ChatPage() {
   };
 
   // ── Message search ────────────────────────────────────────────────────
-  const handleMsgSearch = (query) => {
+  const handleMsgSearch = async (query) => {
     setMsgSearchQuery(query);
     if (!query.trim() || !activeConv) {
       setMsgSearchResults([]);
       return;
     }
-    const convMsgs = msg.messagesByConv[activeConv] || [];
-    const results = convMsgs.filter((m) =>
-      m.plaintext?.toLowerCase().includes(query.toLowerCase())
-    );
+    const results = await msg.searchMessages(query, activeConv);
     setMsgSearchResults(results);
+  };
+
+  const scrollToMessage = (msgId) => {
+    const el = document.getElementById(`msg-${msgId}`);
+    if (el) {
+      el.scrollIntoView({ behavior: "smooth", block: "center" });
+      setHighlightedMsgId(msgId);
+      setTimeout(() => setHighlightedMsgId(null), 2500);
+    }
   };
 
   // ── Create group ──────────────────────────────────────────────────────
@@ -290,14 +354,48 @@ export default function ChatPage() {
     if (!groupName.trim() || groupMembers.length === 0) return;
     try {
       const memberIds = groupMembers.map((u) => u.id);
+      let keyBundle = null;
+      let sessionKey = null;
+
+      if (enc.identity) {
+        // Creator generates a random AES-256 group session key and encrypts/wraps it for each member
+        const myPubKeyB64 = await enc.exportKeys();
+        const fullMemberList = [
+          ...groupMembers.map((m) => ({ id: m.id, publicKeyB64: m.public_key })),
+          { id: auth.userId, publicKeyB64: myPubKeyB64 },
+        ];
+        const res = await enc.generateGroupBundle(fullMemberList);
+        keyBundle = res.bundleJson;
+        sessionKey = res.sessionKey;
+      }
+
+      // Pre-cache key for the created group
+      const onCreated = (data) => {
+        if (sessionKey && data.name === groupName.trim()) {
+          enc.setGroupKey(data.id, sessionKey);
+          if (keyBundle) {
+            ws.send("send_message", {
+              group_id: data.id,
+              ciphertext: keyBundle,
+              message_type: "group_key_bundle",
+            });
+          }
+        }
+      };
+      ws.on("group_created", onCreated);
+
       ws.send("create_group", {
         name: groupName.trim(),
         members: memberIds,
+        key_bundle: keyBundle,
       });
+
       setShowCreateGroup(false);
       setGroupName("");
       setGroupMembers([]);
-    } catch {}
+    } catch (err) {
+      console.error("Error creating group:", err);
+    }
   };
 
   // ── QR trust ──────────────────────────────────────────────────────────
@@ -308,6 +406,7 @@ export default function ChatPage() {
       if (!userId || !publicKey) return;
       const knownUser = users.find((u) => u.id === userId);
       if (!knownUser) return;
+      // Security fix: TOFU trust gate - only call saveTrustedKey after user explicitly confirms the fingerprint matches out-of-band.
       const { fingerprint } = await trustedKeys.verifyAndTrust(publicKey, username, userId);
       const confirmed = window.confirm(
         `Verify identity of "${username}"?\n\nFingerprint:\n${fingerprint}\n\nCompare this with the other user's Settings page.`
@@ -495,11 +594,15 @@ export default function ChatPage() {
     }
   }, [users, enc, ws, msg]);
 
-  const uploadFileFallback = async (file, recipientId, recipientPublicKey) => {
+  const uploadFileFallback = async (file, targetId, recipientPublicKey = null, isGroup = false) => {
     try {
       const formData = new FormData();
       formData.append("file", file, file.name);
-      formData.append("recipient_id", recipientId);
+      if (isGroup) {
+        formData.append("group_id", targetId);
+      } else {
+        formData.append("recipient_id", targetId);
+      }
       const resp = await fetch(`${getApiUrl()}/files/upload`, {
         method: "POST",
         headers: { Authorization: `Bearer ${auth.jwt}` },
@@ -508,12 +611,14 @@ export default function ChatPage() {
       if (!resp.ok) throw new Error("Upload failed");
       const data = await resp.json();
       msg.sendMessage(
-        recipientId,
+        targetId,
         recipientPublicKey,
         `📎 ${file.name}`,
         null,
         "file",
-        { fileId: data.file_id, name: file.name, mime: file.type, size: file.size }
+        { fileId: data.file_id, name: file.name, mime: file.type, size: file.size },
+        null,
+        isGroup
       );
     } catch {}
   };
@@ -534,6 +639,7 @@ export default function ChatPage() {
 
   // ── Derived data ───────────────────────────────────────────────────────
 
+  const activeGroup = activeConv ? msg.conversations.find((c) => c.userId === activeConv && c.isGroup) : null;
   const activeUser = activeConv ? users.find((u) => u.id === activeConv) : null;
   const convMessages = activeConv ? msg.messagesByConv[activeConv] || [] : [];
   const isOnline = activeConv ? msg.onlineUsers.has(activeConv) : false;
@@ -555,6 +661,25 @@ export default function ChatPage() {
         unreadCount: msg.unreadCounts[u.id] || 0,
         lastSeen: u.last_seen || null,
       };
+    });
+
+    // Include groups
+    msg.conversations.forEach((c) => {
+      if (c.isGroup && !list.find((x) => x.userId === c.userId)) {
+        list.push({
+          userId: c.userId,
+          username: c.username,
+          publicKeyB64: null,
+          lastMessage: c.lastMessage || null,
+          lastTime: c.lastTime || null,
+          isOnline: false,
+          isGroup: true,
+          memberIds: c.memberIds || [],
+          createdBy: c.createdBy || null,
+          unreadCount: msg.unreadCounts[c.userId] || 0,
+          lastSeen: null,
+        });
+      }
     });
     // Sort: unread first, then online, then by most recent message, then alphabetically
     list.sort((a, b) => {
@@ -790,11 +915,21 @@ export default function ChatPage() {
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" />
                 </svg>
               </button>
-              <UserAvatar username={activeUser?.username} size="sm" />
+
+              {activeGroup ? (
+                <div className="w-9 h-9 rounded-full bg-whatsapp-teal text-white flex items-center justify-center font-bold text-sm">
+                  👥
+                </div>
+              ) : (
+                <UserAvatar username={activeUser?.username} size="sm" />
+              )}
+
               <div className="ml-3 flex-1">
                 <div className="flex items-center gap-2">
-                  <span className="font-medium text-gray-900">{activeUser?.username}</span>
-                  {activeConv && (
+                  <span className="font-medium text-gray-900">
+                    {activeGroup ? activeGroup.username : activeUser?.username}
+                  </span>
+                  {!activeGroup && activeConv && (
                     <span title={trustedKeysMap[activeConv] ? "Verified" : "Unverified"}>
                       {trustedKeysMap[activeConv] ? (
                         <svg className="w-4 h-4 text-whatsapp-green" fill="currentColor" viewBox="0 0 24 24">
@@ -809,7 +944,14 @@ export default function ChatPage() {
                   )}
                 </div>
                 <div className="text-xs text-gray-500">
-                  {isTyping ? (
+                  {activeGroup ? (
+                    <button
+                      onClick={() => setShowGroupModal(true)}
+                      className="hover:underline text-whatsapp-green font-medium cursor-pointer"
+                    >
+                      {activeGroup.memberIds?.length || 0} members (click to view)
+                    </button>
+                  ) : isTyping ? (
                     <span className="text-whatsapp-green">typing...</span>
                   ) : isOnline ? (
                     <span className="text-whatsapp-green">online</span>
@@ -818,6 +960,23 @@ export default function ChatPage() {
                   )}
                 </div>
               </div>
+
+              {/* Group actions: Leave group */}
+              {activeGroup && (
+                <button
+                  onClick={() => {
+                    if (window.confirm(`Are you sure you want to leave "${activeGroup.username}"?`)) {
+                      ws.send("leave_group", { group_id: activeConv });
+                      setActiveConv(null);
+                    }
+                  }}
+                  className="mr-2 px-2.5 py-1 text-xs font-medium text-red-600 border border-red-200 rounded-lg hover:bg-red-50 transition"
+                  title="Leave this group"
+                >
+                  Leave group
+                </button>
+              )}
+
               {/* In-chat search toggle */}
               <button
                 onClick={() => setShowMsgSearch(!showMsgSearch)}
@@ -852,6 +1011,26 @@ export default function ChatPage() {
                     {msgSearchResults.length} result{msgSearchResults.length !== 1 ? "s" : ""}
                   </p>
                 )}
+                {/* Search results dropdown */}
+                {msgSearchResults.length > 0 && (
+                  <div className="mt-2 max-h-48 overflow-y-auto divide-y bg-gray-50 rounded-lg border text-xs">
+                    {msgSearchResults.map((res) => (
+                      <div
+                        key={res.id}
+                        onClick={() => scrollToMessage(res.id)}
+                        className="p-2 hover:bg-gray-100 cursor-pointer flex justify-between items-center transition"
+                      >
+                        <div className="truncate mr-2">
+                          <span className="font-semibold text-gray-700">{res.senderName}: </span>
+                          <span className="text-gray-600">{res.plaintext}</span>
+                        </div>
+                        <span className="text-gray-400 whitespace-nowrap">
+                          {res.createdAt ? new Date(res.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ""}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             )}
 
@@ -863,10 +1042,9 @@ export default function ChatPage() {
                 </div>
               )}
               {convMessages.map((m, idx) => {
-                const isHighlighted = msgSearchResults.length > 0 &&
-                  msgSearchResults.includes(m);
+                const isHighlighted = highlightedMsgId === m.id || (msgSearchResults.length > 0 && msgSearchResults.some((x) => x.id === m.id));
                 return (
-                  <div key={m.id} className={`msg-enter ${isHighlighted ? "bg-yellow-100 rounded -mx-2 px-2 py-1" : ""}`}>
+                  <div key={m.id} id={`msg-${m.id}`} className={`msg-enter transition-all duration-300 ${isHighlighted ? "bg-yellow-100 ring-2 ring-yellow-400 rounded-lg -mx-2 px-2 py-1" : ""}`}>
                     <MessageBubble
                       message={m}
                       isOwn={m.isFromMe}
@@ -997,7 +1175,13 @@ export default function ChatPage() {
 
               <FileAttachment
                 onAttach={(file) => {
-                  if (activeConv) initiateFileSend(file, activeConv);
+                  if (activeConv) {
+                    if (activeGroup) {
+                      uploadFileFallback(file, activeConv, null, true);
+                    } else {
+                      initiateFileSend(file, activeConv);
+                    }
+                  }
                 }}
               />
 
@@ -1005,10 +1189,27 @@ export default function ChatPage() {
                 onSend={(blob, duration) => {
                   if (activeConv) {
                     const file = new File([blob], `voice_${Date.now()}.webm`, { type: "audio/webm" });
-                    initiateFileSend(file, activeConv);
+                    if (activeGroup) {
+                      uploadFileFallback(file, activeConv, null, true);
+                    } else {
+                      initiateFileSend(file, activeConv);
+                    }
                   }
                 }}
               />
+
+              {/* Feature: Disappearing messages TTL selector */}
+              <select
+                value={ttlSeconds}
+                onChange={(e) => setTtlSeconds(Number(e.target.value))}
+                className="text-xs bg-white hover:bg-gray-50 text-gray-700 rounded-lg px-2 py-2 border outline-none cursor-pointer"
+                title="Disappearing messages timer"
+              >
+                <option value={0}>⏱️ Off</option>
+                <option value={3600}>⏱️ 1 hour</option>
+                <option value={86400}>⏱️ 1 day</option>
+                <option value={604800}>⏱️ 1 week</option>
+              </select>
 
               <input
                 className="flex-1 bg-white rounded-lg px-4 py-2.5 outline-none border text-sm"
@@ -1122,6 +1323,55 @@ export default function ChatPage() {
           </div>
         </div>
       )}
+      {/* ─── Group Members Modal ─────────────────────────────────────── */}
+      {showGroupModal && activeGroup && (
+        <div className="fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-50">
+          <div className="bg-white rounded-xl shadow-2xl w-96 max-h-[80vh] flex flex-col overflow-hidden">
+            <div className="px-5 py-4 border-b flex justify-between items-center">
+              <div>
+                <h2 className="font-semibold text-lg">{activeGroup.username}</h2>
+                <p className="text-xs text-gray-500">
+                  {activeGroup.memberIds?.length || 0} members · Created by {activeGroup.createdBy === auth.userId ? "You" : (users.find(u => u.id === activeGroup.createdBy)?.username || "Admin")}
+                </p>
+              </div>
+              <button onClick={() => setShowGroupModal(false)}>
+                <svg className="w-6 h-6 text-gray-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+            <div className="p-4 overflow-y-auto flex-1 divide-y">
+              {(activeGroup.memberIds || []).map((mId) => {
+                const memberUser = users.find((u) => u.id === mId) || (mId === auth.userId ? { id: auth.userId, username: `${auth.username} (You)` } : { id: mId, username: "Unknown user" });
+                const isCreator = activeGroup.createdBy === auth.userId;
+                const canRemove = isCreator && mId !== auth.userId;
+                return (
+                  <div key={mId} className="flex items-center justify-between py-2">
+                    <div className="flex items-center gap-3">
+                      <UserAvatar username={memberUser.username} size="sm" />
+                      <span className="text-sm font-medium text-gray-800">{memberUser.username}</span>
+                    </div>
+                    {canRemove && (
+                      <button
+                        onClick={() => {
+                          if (window.confirm(`Remove ${memberUser.username} from group?`)) {
+                            ws.send("remove_member", { group_id: activeConv, target_user_id: mId });
+                          }
+                        }}
+                        className="text-red-500 hover:text-red-700 hover:bg-red-50 p-1 rounded-full text-xs font-semibold px-2"
+                        title="Remove member"
+                      >
+                        ✕
+                      </button>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* ─── QR Scanner Modal ────────────────────────────────────────── */}
       {showQR && (
         <div className="fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-50">

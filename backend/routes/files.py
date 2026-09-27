@@ -15,18 +15,24 @@ import os
 import uuid
 import hashlib
 import time
+from urllib.parse import quote
 
 from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException, Header, Query
 from fastapi.responses import FileResponse
 from pathlib import Path
-from jose import jwt, JWTError
+# Security fix: Replace python-jose with PyJWT to avoid vulnerable non-constant-time ecdsa (PYSEC-2026-1325).
+import jwt
+from jwt.exceptions import PyJWTError as JWTError
 
 import database
 
 router = APIRouter(prefix="/files")
 
 # ── Config ──────────────────────────────────────────────────────────────────
-SECRET_KEY = os.getenv("SECRET_KEY", "change-me-in-production")
+# Security fix: Read SECRET_KEY with no fallback and fail loudly at startup if unset.
+SECRET_KEY = os.getenv("SECRET_KEY")
+if not SECRET_KEY:
+    raise RuntimeError("SECRET_KEY environment variable is not set")
 ALGORITHM = "HS256"
 UPLOAD_DIR = Path("uploads")
 THUMB_DIR = UPLOAD_DIR / "thumbnails"
@@ -148,9 +154,19 @@ async def get_current_user(
         raise HTTPException(status_code=401, detail="Not authenticated")
     try:
         payload = jwt.decode(token_value, SECRET_KEY, algorithms=[ALGORITHM])
-        return payload.get("sub")
+        user_id = payload.get("sub")
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
+
+    # Security fix: Verify user account is active after decoding JWT to reject disabled accounts.
+    async with database.pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT is_active FROM users WHERE id = $1::uuid", user_id
+        )
+    if not row or not row["is_active"]:
+        raise HTTPException(status_code=401, detail="Account disabled")
+
+    return user_id
 
 
 # ── Routes ──────────────────────────────────────────────────────────────────
@@ -160,6 +176,7 @@ async def upload_file(
     file: UploadFile = File(...),
     user_id: str = Depends(get_current_user),
     recipient_id: str = Form(None),
+    group_id: str = Form(None),
 ):
     """
     Upload an encrypted file.
@@ -207,14 +224,14 @@ async def upload_file(
     if file.content_type and file.content_type.startswith("image/"):
         thumbnail_id = await _generate_thumbnail(dest, file_id)
 
-    # Insert metadata into files table
+    # Insert metadata into files table (supporting group_id)
     async with database.pool.acquire() as conn:
         await conn.execute(
             """
-            INSERT INTO files (id, uploader_id, recipient_id, original_filename, mimetype, size_bytes)
-            VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, $6)
+            INSERT INTO files (id, uploader_id, recipient_id, group_id, original_filename, mimetype, size_bytes)
+            VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, $7)
             """,
-            file_id, user_id, recipient_id, file.filename, file.content_type, len(content),
+            file_id, user_id, recipient_id if recipient_id else None, group_id if group_id else None, file.filename, file.content_type, len(content),
         )
 
     return {
@@ -224,26 +241,42 @@ async def upload_file(
         "mime_type": file.content_type,
         "checksum": checksum,
         "thumbnail_id": thumbnail_id,
+        "group_id": group_id,
     }
 
 
 async def _check_file_access(file_id: str, user_id: str):
-    """Verify that the requesting user is the sender or recipient of this file.
+    """Verify that the requesting user is the sender, recipient, or group member.
 
     Queries the files table in the DB for persistent access control
     that survives server restarts. Raises 403 if unauthorized.
     """
     async with database.pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT uploader_id, recipient_id FROM files WHERE id = $1::uuid",
+            "SELECT uploader_id, recipient_id, group_id FROM files WHERE id = $1::uuid",
             file_id,
         )
     if not row:
         raise HTTPException(status_code=404, detail="File not found")
     uploader = str(row["uploader_id"])
     recipient = str(row["recipient_id"]) if row["recipient_id"] else None
-    if user_id != uploader and user_id != recipient:
-        raise HTTPException(status_code=403, detail="Access denied")
+    group_id = str(row["group_id"]) if row["group_id"] else None
+
+    # Uploader and direct recipient always have access
+    if user_id == uploader or (recipient and user_id == recipient):
+        return
+
+    # If associated with a group, allow any group member to download
+    if group_id:
+        async with database.pool.acquire() as conn:
+            member = await conn.fetchrow(
+                "SELECT 1 FROM group_members WHERE group_id = $1::uuid AND user_id = $2::uuid",
+                group_id, user_id,
+            )
+        if member:
+            return
+
+    raise HTTPException(status_code=403, detail="Access denied")
 
 
 @router.get("/{file_id}")
@@ -274,7 +307,10 @@ async def download_file(file_id: str, user_id: str = Depends(get_current_user)):
             if row["mimetype"]:
                 media_type = row["mimetype"]
 
-    headers = {"Content-Disposition": f'attachment; filename="{original_name}"'}
+    # Security fix: Sanitize filename by stripping CR/LF/quotes and encoding per RFC 5987 to prevent header injection.
+    safe_name = original_name.replace("\r", "").replace("\n", "").replace('"', "")
+    encoded_name = quote(safe_name)
+    headers = {"Content-Disposition": f"attachment; filename=\"{encoded_name}\"; filename*=utf-8''{encoded_name}"}
     return FileResponse(file_path, media_type=media_type, headers=headers)
 
 
@@ -302,11 +338,16 @@ async def _generate_thumbnail(file_path: Path, file_id: str) -> str | None:
     try:
         from PIL import Image
 
+        # Security fix: Cap maximum image pixels to protect against decompression bomb DoS attacks.
+        Image.MAX_IMAGE_PIXELS = 64_000_000
+
         THUMB_DIR.mkdir(parents=True, exist_ok=True)
         thumb_path = THUMB_DIR / file_id
         img = Image.open(file_path)
         img.thumbnail((200, 200))
         img.save(thumb_path, "JPEG")
         return file_id
+    except Image.DecompressionBombError:
+        return None
     except Exception:
         return None

@@ -4,6 +4,7 @@ import SetupPage from "./pages/SetupPage";
 import LoginPage from "./pages/LoginPage";
 import ChatPage from "./pages/ChatPage";
 import SettingsPage from "./pages/SettingsPage";
+import AdminPage from "./pages/AdminPage";
 import { getCachedSession, getCachedPassphrase, loadKeysFromStorage } from "./utils/crypto";
 
 // ── Auth Context ──────────────────────────────────────────────────────────
@@ -109,6 +110,7 @@ export default function App() {
             <Route path="/login" element={<LoginPage />} />
             <Route path="/chat" element={<ChatPage />} />
             <Route path="/settings" element={<SettingsPage />} />
+            <Route path="/admin" element={<AdminPage />} />
             <Route
               path="*"
               element={

@@ -13,11 +13,17 @@ import {
   signChallenge,
   getCachedPassphrase,
   clearSession,
+  createGroupKeyBundle,
+  unwrapGroupKeyBundle,
+  importRawGroupKey,
+  encryptGroupMessage,
+  decryptGroupMessage,
 } from "../utils/crypto";
 
 export function useEncryption() {
   const [identity, setIdentity] = useState(null);
   const sharedKeysRef = useRef({}); // cache: { userId: sharedKey }
+  const groupKeysRef = useRef({}); // cache: { groupId: groupSessionKey }
   const identityRef = useRef(null); // synchronous mirror of identity
 
   function getIdentity() {
@@ -131,10 +137,50 @@ export function useEncryption() {
     }
   }, []);
 
+  const generateGroupBundle = useCallback(async (memberList) => {
+    const id = getIdentity();
+    if (!id) throw new Error("No identity — unlock first");
+    return createGroupKeyBundle(id.keyAgreement.privateKey, memberList);
+  }, []);
+
+  const setGroupKey = useCallback((groupId, key) => {
+    groupKeysRef.current[groupId] = key;
+  }, []);
+
+  const getGroupKey = useCallback((groupId) => {
+    return groupKeysRef.current[groupId] || null;
+  }, []);
+
+  const unwrapAndStoreGroupKey = useCallback(async (groupId, creatorPublicKeyB64, bundleData, myUserId) => {
+    const id = getIdentity();
+    if (!id) throw new Error("No identity — unlock first");
+    const key = await unwrapGroupKeyBundle(
+      id.keyAgreement.privateKey,
+      creatorPublicKeyB64,
+      bundleData,
+      myUserId
+    );
+    groupKeysRef.current[groupId] = key;
+    return key;
+  }, []);
+
+  const encryptGroup = useCallback(async (groupId, plaintext) => {
+    const key = groupKeysRef.current[groupId];
+    if (!key) throw new Error(`No group key found for group ${groupId}`);
+    return encryptGroupMessage(key, plaintext);
+  }, []);
+
+  const decryptGroup = useCallback(async (groupId, iv, ciphertext) => {
+    const key = groupKeysRef.current[groupId];
+    if (!key) throw new Error(`No group key found for group ${groupId}`);
+    return decryptGroupMessage(key, iv, ciphertext);
+  }, []);
+
   const signOut = useCallback(() => {
     identityRef.current = null;
     setIdentity(null);
     sharedKeysRef.current = {};
+    groupKeysRef.current = {};
     clearSession();
   }, []);
 
@@ -149,6 +195,12 @@ export function useEncryption() {
     getSharedKey,
     encryptBuffer: encryptBufferData,
     decryptBuffer: decryptBufferData,
+    generateGroupBundle,
+    setGroupKey,
+    getGroupKey,
+    unwrapAndStoreGroupKey,
+    encryptGroup,
+    decryptGroup,
     sign,
     exportKeys,
     signOut,

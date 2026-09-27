@@ -55,6 +55,8 @@ async def create_tables():
                 username TEXT UNIQUE NOT NULL,
                 public_key TEXT NOT NULL,
                 wrapped_keys TEXT,
+                -- Security fix: Add is_active flag to enable disabling departed user accounts.
+                is_active BOOLEAN NOT NULL DEFAULT true,
                 last_seen TIMESTAMP,
                 created_at TIMESTAMP DEFAULT now()
             );
@@ -67,15 +69,17 @@ async def create_tables():
                 group_id UUID,
                 ciphertext TEXT NOT NULL,
                 message_type TEXT DEFAULT 'text',
-                reply_to_id UUID REFERENCES messages(id),
+                reply_to_id UUID REFERENCES messages(id) ON DELETE SET NULL,
                 is_deleted BOOLEAN DEFAULT false,
+                -- Feature: Disappearing messages TTL
+                expires_at TIMESTAMP,
                 created_at TIMESTAMP DEFAULT now()
             );
 
             -- message_status: tracks delivery/read state per user
             CREATE TABLE IF NOT EXISTS message_status (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                message_id UUID REFERENCES messages(id),
+                message_id UUID REFERENCES messages(id) ON DELETE CASCADE,
                 user_id UUID REFERENCES users(id),
                 status TEXT DEFAULT 'sent',
                 updated_at TIMESTAMP DEFAULT now()
@@ -88,7 +92,7 @@ async def create_tables():
             -- UNIQUE constraint prevents double-tap exploits (L-08)
             CREATE TABLE IF NOT EXISTS reactions (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                message_id UUID REFERENCES messages(id),
+                message_id UUID REFERENCES messages(id) ON DELETE CASCADE,
                 user_id UUID REFERENCES users(id),
                 emoji TEXT NOT NULL,
                 created_at TIMESTAMP DEFAULT now(),
@@ -104,6 +108,36 @@ async def create_tables():
 
             -- migration: add wrapped_keys if missing (existing databases)
             ALTER TABLE users ADD COLUMN IF NOT EXISTS wrapped_keys TEXT;
+
+            -- migration: add is_active if missing (existing databases)
+            -- Security fix: Add is_active column to support disabling departed employee accounts.
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT true;
+
+            -- migration: add expires_at if missing (existing databases)
+            -- Feature: Add expires_at column for disappearing messages TTL.
+            ALTER TABLE messages ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP;
+
+            -- migration: foreign key cascade deletes for messages TTL cleanup
+            DO $$ BEGIN
+                ALTER TABLE message_status DROP CONSTRAINT IF EXISTS message_status_message_id_fkey;
+                ALTER TABLE message_status ADD CONSTRAINT message_status_message_id_fkey
+                    FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE;
+            EXCEPTION WHEN others THEN NULL;
+            END $$;
+
+            DO $$ BEGIN
+                ALTER TABLE reactions DROP CONSTRAINT IF EXISTS reactions_message_id_fkey;
+                ALTER TABLE reactions ADD CONSTRAINT reactions_message_id_fkey
+                    FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE;
+            EXCEPTION WHEN others THEN NULL;
+            END $$;
+
+            DO $$ BEGIN
+                ALTER TABLE messages DROP CONSTRAINT IF EXISTS messages_reply_to_id_fkey;
+                ALTER TABLE messages ADD CONSTRAINT messages_reply_to_id_fkey
+                    FOREIGN KEY (reply_to_id) REFERENCES messages(id) ON DELETE SET NULL;
+            EXCEPTION WHEN others THEN NULL;
+            END $$;
 
             -- groups: chat rooms for group messaging
             CREATE TABLE IF NOT EXISTS groups (
@@ -126,10 +160,14 @@ async def create_tables():
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                 uploader_id UUID REFERENCES users(id),
                 recipient_id UUID REFERENCES users(id),
+                group_id UUID,
                 original_filename TEXT NOT NULL,
                 mimetype TEXT,
                 size_bytes BIGINT,
                 iv TEXT,
                 created_at TIMESTAMP DEFAULT now()
             );
+
+            -- migration: add group_id to files if missing (existing databases)
+            ALTER TABLE files ADD COLUMN IF NOT EXISTS group_id UUID;
         """)

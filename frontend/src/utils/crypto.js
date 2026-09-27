@@ -952,3 +952,123 @@ export function base64ToArrayBuffer(base64) {
   }
   return bytes.buffer;
 }
+
+// ──────────────────────────────────────────────────────────────────────────
+// 15. Sender-Keys Group End-to-End Encryption
+// ──────────────────────────────────────────────────────────────────────────
+/*
+ * SENDER-KEYS / GROUP SESSION KEY ENCRYPTION DESIGN:
+ *
+ * In a group chat, encrypting each message individually N times for N members
+ * scales poorly (O(N) network and storage overhead per message).
+ * Instead, LANChat implements a Sender-Keys / Group Session Key model:
+ *
+ * 1. Key Generation (Group Creation):
+ *    When a group is created, the creator generates a random AES-256-GCM
+ *    group session key client-side using Web Crypto.
+ *
+ * 2. Key Distribution (Wrapping):
+ *    The creator exports the raw 256-bit key and encrypts/wraps an individual
+ *    copy for each group member using the ECDH shared secret established
+ *    between the creator's ECDH private key and that member's ECDH public key.
+ *    The wrapped bundle { [memberId]: { iv: base64, key: base64 } } is sent
+ *    to the server as message_type: "group_key_bundle".
+ *
+ * 3. Server Storage & Zero-Knowledge Relay:
+ *    The server stores the group_key_bundle message and relays it to members
+ *    who are currently online (via WebSocket) or members who join later (via
+ *    REST /messages/group/{group_id} history). The server never holds private
+ *    keys and cannot decrypt any wrapped session keys.
+ *
+ * 4. Group Message Encryption & Decryption:
+ *    All group messages are encrypted ONCE using the shared AES-256-GCM
+ *    session key and sent as a single ciphertext. Any recipient with the
+ *    unwrapped group session key decrypts it in O(1) time.
+ */
+
+export async function createGroupKeyBundle(myPrivateKey, memberList) {
+  // Generate a random AES-256-GCM group session key
+  const sessionKey = await crypto.subtle.generateKey(
+    { name: "AES-GCM", length: 256 },
+    true, // extractable so we can export and wrap it
+    ["encrypt", "decrypt"]
+  );
+
+  const rawKey = await crypto.subtle.exportKey("raw", sessionKey);
+  const bundle = {};
+
+  for (const member of memberList) {
+    const pubKeyB64 = member.publicKeyB64 || member.public_key;
+    if (!pubKeyB64) continue;
+    try {
+      const { publicKey } = await importPublicKey(pubKeyB64);
+      const sharedSecret = await deriveSharedSecret(myPrivateKey, publicKey);
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      const encrypted = await crypto.subtle.encrypt(
+        { name: "AES-GCM", iv, tagLength: 128 },
+        sharedSecret,
+        rawKey
+      );
+      bundle[member.id || member.userId] = {
+        iv: arrayBufferToBase64(iv.buffer),
+        key: arrayBufferToBase64(encrypted),
+      };
+    } catch (err) {
+      console.error(`Failed to wrap group key for member ${member.id || member.userId}:`, err);
+    }
+  }
+
+  return {
+    sessionKey,
+    rawKeyB64: arrayBufferToBase64(rawKey),
+    bundleJson: JSON.stringify(bundle),
+  };
+}
+
+export async function unwrapGroupKeyBundle(myPrivateKey, creatorPublicKeyB64, bundleData, myUserId) {
+  const bundle = typeof bundleData === "string" ? JSON.parse(bundleData) : bundleData;
+  const myEntry = bundle[myUserId];
+  if (!myEntry) {
+    throw new Error("No wrapped key for this user in group key bundle");
+  }
+
+  const { publicKey } = await importPublicKey(creatorPublicKeyB64);
+  const sharedSecret = await deriveSharedSecret(myPrivateKey, publicKey);
+
+  const iv = base64ToArrayBuffer(myEntry.iv);
+  const encryptedKey = base64ToArrayBuffer(myEntry.key);
+
+  const rawKey = await crypto.subtle.decrypt(
+    { name: "AES-GCM", iv: new Uint8Array(iv), tagLength: 128 },
+    sharedSecret,
+    encryptedKey
+  );
+
+  return await crypto.subtle.importKey(
+    "raw",
+    rawKey,
+    { name: "AES-GCM", length: 256 },
+    true,
+    ["encrypt", "decrypt"]
+  );
+}
+
+export async function importRawGroupKey(rawKeyB64) {
+  const rawKey = base64ToArrayBuffer(rawKeyB64);
+  return await crypto.subtle.importKey(
+    "raw",
+    rawKey,
+    { name: "AES-GCM", length: 256 },
+    true,
+    ["encrypt", "decrypt"]
+  );
+}
+
+export async function encryptGroupMessage(groupSessionKey, plaintext) {
+  return await encryptMessage(groupSessionKey, plaintext);
+}
+
+export async function decryptGroupMessage(groupSessionKey, ivBase64, ciphertextBase64) {
+  return await decryptMessage(groupSessionKey, ivBase64, ciphertextBase64);
+}
+

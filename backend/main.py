@@ -60,6 +60,8 @@ def check_rate_limit(user_id: str):
 
 # ── Discovery ───────────────────────────────────────────────────────────────
 discovery = DiscoveryService(port=PORT)
+# Security fix: Read DISCOVERY_ENABLED to allow disabling mDNS broadcast on untrusted networks.
+DISCOVERY_ENABLED = os.getenv("DISCOVERY_ENABLED", "true").strip().lower() in ("true", "1", "yes")
 
 
 # ── Suppress Windows asyncio transport cleanup errors ──────────────────────
@@ -87,19 +89,35 @@ async def lifespan(app: FastAPI):
     await create_tables()
     loop = asyncio.get_event_loop()
     loop.set_exception_handler(_ignore_connection_reset)
-    # Start LAN discovery in a background thread (Zeroconf is synchronous)
-    await loop.run_in_executor(None, discovery.start)
-    await loop.run_in_executor(None, discovery.print_qr)
+    # Start LAN discovery in a background thread if enabled
+    if DISCOVERY_ENABLED:
+        await loop.run_in_executor(None, discovery.start)
+        await loop.run_in_executor(None, discovery.print_qr)
     print(f"[server] LANChat running on http://{discovery.ip}:{PORT}")
+
+    # Feature: Background task to clean up expired TTL messages every 60 seconds
+    async def _message_ttl_cleanup_loop():
+        while True:
+            try:
+                await asyncio.sleep(60)
+                await manager.cleanup_expired_messages()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                print(f"[ttl_cleanup] error: {e}")
+
+    ttl_task = asyncio.create_task(_message_ttl_cleanup_loop())
 
     yield
 
     # ── SHUTDOWN ──────────────────────────────────────────────────────────
     print("[server] Shutting down...")
+    ttl_task.cancel()
     # Close all WebSocket connections gracefully
     await manager.disconnect_all()
-    # Stop LAN discovery
-    await loop.run_in_executor(None, discovery.stop)
+    # Stop LAN discovery if started
+    if DISCOVERY_ENABLED:
+        await loop.run_in_executor(None, discovery.stop)
     # Close database connections
     await close_pool()
     print("[server] Goodbye!")
@@ -217,6 +235,16 @@ async def websocket_endpoint(
         await websocket.close(code=4001)
         return
 
+    # Security fix: Check is_active in DB and reject disabled accounts during WebSocket handshake.
+    import database
+    async with database.pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT is_active FROM users WHERE id = $1::uuid", user_id
+        )
+    if not row or not row["is_active"]:
+        await websocket.close(code=4001)
+        return
+
     await manager.connect(websocket, user_id)
 
     try:
@@ -246,6 +274,8 @@ async def websocket_endpoint(
                 "message_delete": manager.handle_message_delete,
                 "webrtc_signal": manager.handle_webrtc_signal,
                 "create_group": manager.handle_create_group,
+                "leave_group": manager.handle_leave_group,
+                "remove_member": manager.handle_remove_member,
             }
 
             if event == "ping":

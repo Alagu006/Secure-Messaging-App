@@ -30,16 +30,37 @@
 import { arrayBufferToBase64, base64ToArrayBuffer } from "./crypto";
 
 const CHUNK_SIZE = 64 * 1024; // 64 KB per chunk
-// Google's free STUN server helps with mDNS hostname resolution on Chrome.
-// File data still travels P2P — STUN only helps peers discover each other.
-const ICE_SERVERS = [
-  { urls: "stun:stun.l.google.com:19302" },
+
+// Configurable ICE servers with fallback for isolated/air-gapped LANs
+let currentIceServers = [
+  { urls: import.meta.env.VITE_STUN_SERVER || "stun:stun.l.google.com:19302" },
 ];
+
+if (import.meta.env.VITE_OFFLINE_MODE === "true" || import.meta.env.VITE_OFFLINE_MODE === "1") {
+  currentIceServers = [];
+} else if (typeof window !== "undefined" && typeof fetch === "function") {
+  // Reachability check on startup: if internet/STUN host is unreachable within 2s, fall back to host-only
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 2000);
+    fetch("https://www.google.com/generate_204", { mode: "no-cors", signal: controller.signal })
+      .then(() => clearTimeout(timeoutId))
+      .catch(() => {
+        currentIceServers = [];
+      });
+  } catch {
+    currentIceServers = [];
+  }
+}
+
+export function getIceServers() {
+  return currentIceServers;
+}
 
 // ── 1. createPeerConnection() ────────────────────────────────────────────
 
 export function createPeerConnection(signalingCallback, isReceiver = false) {
-  const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+  const pc = new RTCPeerConnection({ iceServers: getIceServers() });
   const pendingCandidates = [];
 
   pc.onicecandidate = (event) => {

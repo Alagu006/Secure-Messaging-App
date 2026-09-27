@@ -12,13 +12,19 @@ message_id) to know where to route things.
 """
 
 import os
+from datetime import datetime, timedelta
 
 from fastapi import WebSocket
-from jose import jwt, JWTError
+# Security fix: Replace python-jose with PyJWT to avoid vulnerable non-constant-time ecdsa (PYSEC-2026-1325).
+import jwt
+from jwt.exceptions import PyJWTError as JWTError
 import database
 
 # ── JWT config (same secret key used by auth.py) ──────────────────────────
+# Security fix: Read SECRET_KEY with no default and fail loudly at startup if unset.
 SECRET_KEY = os.getenv("SECRET_KEY")
+if not SECRET_KEY:
+    raise RuntimeError("SECRET_KEY environment variable is not set")
 ALGORITHM = "HS256"
 
 
@@ -124,8 +130,9 @@ class ConnectionManager:
                 ws = self.active_connections.get(user_id)
                 if ws:
                     await ws.close(code=1001, reason="Server shutdown")
-            except Exception:
-                pass
+            except Exception as e:
+                # Security fix: Log cleanup error instead of silently discarding it.
+                print(f"[cleanup] ignored error: {e}")
         self.active_connections.clear()
 
     async def _get_conversation_users(self, sender_id: str, data: dict) -> list[str]:
@@ -202,14 +209,20 @@ class ConnectionManager:
         if not ciphertext:
             return  # nothing to send
 
+        # Feature: Compute expiration timestamp if TTL is specified
+        ttl_seconds = data.get("ttl_seconds")
+        expires_at = None
+        if ttl_seconds and isinstance(ttl_seconds, (int, float)) and ttl_seconds > 0:
+            expires_at = datetime.utcnow() + timedelta(seconds=int(ttl_seconds))
+
         # Insert the message into the database
         async with database.pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
                 INSERT INTO messages (sender_id, recipient_id, group_id,
-                                      ciphertext, message_type, reply_to_id)
-                VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, $6::uuid)
-                RETURNING id, created_at
+                                      ciphertext, message_type, reply_to_id, expires_at)
+                VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, $6::uuid, $7)
+                RETURNING id, created_at, expires_at
                 """,
                 sender_id,
                 recipient_id,
@@ -217,10 +230,12 @@ class ConnectionManager:
                 ciphertext,
                 message_type,
                 reply_to_id,
+                expires_at,
             )
 
         message_id = str(row["id"])
         created_at = row["created_at"].isoformat() if row["created_at"] else None
+        expires_at_iso = row["expires_at"].isoformat() if row["expires_at"] else None
 
         # Determine if recipient is online
         recipient_online = recipient_id and recipient_id in self.active_connections
@@ -262,6 +277,7 @@ class ConnectionManager:
                 "message_type": message_type,
                 "reply_to_id": reply_to_id,
                 "created_at": created_at,
+                "expires_at": expires_at_iso,
             },
         }
 
@@ -327,6 +343,13 @@ class ConnectionManager:
         if not message_id or not other_user_id:
             return
 
+        # Security fix: Verify caller is a conversation participant before marking message as read.
+        participants = await self._get_message_participants(message_id)
+        if reader_id not in participants:
+            return await self.send_personal(reader_id, {
+                "event": "error", "data": {"message": "Unauthorized: Not a conversation participant"},
+            })
+
         # Update message_status to 'read'
         async with database.pool.acquire() as conn:
             await conn.execute(
@@ -355,6 +378,13 @@ class ConnectionManager:
 
         if not message_id or not emoji:
             return
+
+        # Security fix: Verify caller is a conversation participant before processing reactions.
+        targets = await self._get_message_participants(message_id)
+        if user_id not in targets:
+            return await self.send_personal(user_id, {
+                "event": "error", "data": {"message": "Unauthorized: Not a conversation participant"},
+            })
 
         # Save to the reactions table (deduplicate by message_id + user_id + emoji)
         async with database.pool.acquire() as conn:
@@ -492,6 +522,8 @@ class ConnectionManager:
         if sender_id not in member_ids:
             member_ids = [sender_id] + list(member_ids)
 
+        key_bundle = data.get("key_bundle")
+
         async with database.pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
@@ -509,6 +541,16 @@ class ConnectionManager:
                     group_id, uid,
                 )
 
+            # Store group key bundle message if supplied by group creator
+            if key_bundle:
+                await conn.execute(
+                    """
+                    INSERT INTO messages (sender_id, group_id, ciphertext, message_type)
+                    VALUES ($1::uuid, $2::uuid, $3, 'group_key_bundle')
+                    """,
+                    sender_id, group_id, str(key_bundle),
+                )
+
         # Notify all members
         await self.broadcast_to_users(member_ids, {
             "event": "group_created",
@@ -517,8 +559,103 @@ class ConnectionManager:
                 "name": group_name,
                 "created_by": sender_id,
                 "members": member_ids,
+                "key_bundle": key_bundle,
             },
         })
+
+    async def _get_group_members(self, group_id: str) -> list[str]:
+        """Fetch all member user IDs for a group."""
+        async with database.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT user_id FROM group_members WHERE group_id = $1::uuid",
+                group_id,
+            )
+        return [str(r["user_id"]) for r in rows]
+
+    async def handle_leave_group(self, user_id: str, data: dict):
+        """Remove caller from group and broadcast member_left to remaining members."""
+        group_id = data.get("group_id")
+        if not group_id:
+            return
+
+        async with database.pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM group_members WHERE group_id = $1::uuid AND user_id = $2::uuid",
+                group_id, user_id,
+            )
+
+        # Broadcast member_left to remaining members
+        remaining = await self._get_group_members(group_id)
+        await self.broadcast_to_users(remaining, {
+            "event": "member_left",
+            "data": {
+                "group_id": group_id,
+                "user_id": user_id,
+            },
+        })
+
+    async def handle_remove_member(self, user_id: str, data: dict):
+        """Allow group creator to remove a member and broadcast member_removed."""
+        group_id = data.get("group_id")
+        target_user_id = data.get("target_user_id") or data.get("user_id")
+        if not group_id or not target_user_id:
+            return
+
+        async with database.pool.acquire() as conn:
+            group = await conn.fetchrow(
+                "SELECT created_by FROM groups WHERE id = $1::uuid", group_id
+            )
+            # Only the creator of the group can remove members
+            if not group or str(group["created_by"]) != user_id:
+                return await self.send_personal(user_id, {
+                    "event": "error", "data": {"message": "Only the group creator can remove members"},
+                })
+
+            await conn.execute(
+                "DELETE FROM group_members WHERE group_id = $1::uuid AND user_id = $2::uuid",
+                group_id, target_user_id,
+            )
+
+        # Broadcast member_removed to remaining members + removed user so their UI updates
+        remaining = await self._get_group_members(group_id)
+        targets = list(set(remaining + [target_user_id]))
+        await self.broadcast_to_users(targets, {
+            "event": "member_removed",
+            "data": {
+                "group_id": group_id,
+                "user_id": target_user_id,
+                "removed_by": user_id,
+            },
+        })
+
+    async def cleanup_expired_messages(self):
+        """Delete messages whose TTL has expired and broadcast message_deleted to participants."""
+        async with database.pool.acquire() as conn:
+            expired_rows = await conn.fetch(
+                """
+                SELECT id FROM messages
+                WHERE expires_at IS NOT NULL AND expires_at < now()
+                """
+            )
+            if not expired_rows:
+                return
+
+            for row in expired_rows:
+                msg_id = str(row["id"])
+                targets = await self._get_message_participants(msg_id)
+                # Clean up dependent rows defensively in case of older DB schemas
+                await conn.execute("DELETE FROM message_status WHERE message_id = $1::uuid", row["id"])
+                await conn.execute("DELETE FROM reactions WHERE message_id = $1::uuid", row["id"])
+                await conn.execute("UPDATE messages SET reply_to_id = NULL WHERE reply_to_id = $1::uuid", row["id"])
+                await conn.execute("DELETE FROM messages WHERE id = $1::uuid", row["id"])
+                if targets:
+                    await self.broadcast_to_users(targets, {
+                        "event": "message_deleted",
+                        "data": {
+                            "message_id": msg_id,
+                            "deleted_by": "system",
+                        },
+                    })
 
 
 # Create a single shared instance that the WebSocket route will use

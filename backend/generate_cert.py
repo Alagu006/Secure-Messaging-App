@@ -74,7 +74,8 @@ def main():
         .not_valid_after(datetime.utcnow() + timedelta(days=3650))  # 10 years
         .add_extension(x509.SubjectAlternativeName(san_list), critical=False)
         .add_extension(
-            x509.BasicConstraints(ca=True, path_length=None), critical=True
+            # Security fix: Set ca=False since this is a leaf/server certificate, not a CA.
+            x509.BasicConstraints(ca=False, path_length=None), critical=True
         )
         .sign(key, hashes.SHA256())
     )

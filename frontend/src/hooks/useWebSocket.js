@@ -25,6 +25,7 @@ export function useWebSocket(userId, jwt) {
   const [connected, setConnected] = useState(false);
   const reconnectAttemptRef = useRef(0);
   const reconnectTimerRef = useRef(null);
+  const isIntentionalCloseRef = useRef(false);
 
   const connect = useCallback(() => {
     if (!userId || !jwt) return;
@@ -41,6 +42,8 @@ export function useWebSocket(userId, jwt) {
     ws.onclose = () => {
       setConnected(false);
       wsRef.current = null;
+      // Skip reconnect if this disconnect was intentional (logout or unmount)
+      if (isIntentionalCloseRef.current) return;
       const attempt = reconnectAttemptRef.current;
       const delay = Math.min(BASE_RECONNECT_DELAY * Math.pow(2, attempt), MAX_RECONNECT_DELAY);
       reconnectAttemptRef.current = attempt + 1;
@@ -61,8 +64,10 @@ export function useWebSocket(userId, jwt) {
   }, [userId, jwt]);
 
   useEffect(() => {
+    isIntentionalCloseRef.current = false;
     connect();
     return () => {
+      isIntentionalCloseRef.current = true;
       clearTimeout(reconnectTimerRef.current);
       wsRef.current?.close();
       wsRef.current = null;
