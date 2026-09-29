@@ -989,6 +989,23 @@ export async function loadGroupKeyFromStorage(groupId) {
 }
 
 
+export async function hasStoredKeys() {
+  try {
+    const db = await openKeyDB();
+    const tx = db.transaction(STORE_NAME, "readonly");
+    const store = tx.objectStore(STORE_NAME);
+    const record = await new Promise((resolve) => {
+      const r = store.get("main");
+      r.onsuccess = () => resolve(r.result);
+      r.onerror = () => resolve(null);
+    });
+    db.close();
+    return !!record;
+  } catch {
+    return false;
+  }
+}
+
 export function arrayBufferToBase64(buffer) {
   /*
     Convert an ArrayBuffer to a base64 string.

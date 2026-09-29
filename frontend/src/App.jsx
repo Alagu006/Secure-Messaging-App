@@ -5,7 +5,7 @@ import LoginPage from "./pages/LoginPage";
 import ChatPage from "./pages/ChatPage";
 import SettingsPage from "./pages/SettingsPage";
 import AdminPage from "./pages/AdminPage";
-import { getCachedSession, getCachedPassphrase, loadKeysFromStorage } from "./utils/crypto";
+import { getCachedSession, getCachedPassphrase, loadKeysFromStorage, hasStoredKeys } from "./utils/crypto";
 
 // ── Auth Context ──────────────────────────────────────────────────────────
 export const AuthContext = createContext(null);
@@ -66,26 +66,8 @@ export default function App() {
           }
         }
         // Session restore failed — check if keys exist on disk
-        const db = await new Promise((resolve, reject) => {
-          const req = indexedDB.open("lanchat-keys", 2);
-          req.onupgradeneeded = (e) => {
-            const d = e.target.result;
-            if (!d.objectStoreNames.contains("identity")) {
-              d.createObjectStore("identity", { keyPath: "id" });
-            }
-          };
-          req.onsuccess = (e) => resolve(e.target.result);
-          req.onerror = () => reject(req.error);
-        });
-        const tx = db.transaction("identity", "readonly");
-        const store = tx.objectStore("identity");
-        const record = await new Promise((resolve) => {
-          const r = store.get("main");
-          r.onsuccess = () => resolve(r.result);
-          r.onerror = () => resolve(null);
-        });
-        db.close();
-        setHasKeys(!!record);
+        const keysExist = await hasStoredKeys();
+        setHasKeys(keysExist);
       } catch {
         setHasKeys(false);
       }
