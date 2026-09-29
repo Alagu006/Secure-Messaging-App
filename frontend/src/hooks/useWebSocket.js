@@ -29,7 +29,12 @@ export function useWebSocket(userId, jwt) {
 
   const connect = useCallback(() => {
     if (!userId || !jwt) return;
-    if (wsRef.current?.readyState === WebSocket.OPEN) return;
+    if (
+      wsRef.current?.readyState === WebSocket.OPEN ||
+      wsRef.current?.readyState === WebSocket.CONNECTING
+    ) {
+      return;
+    }
 
     const url = getWsUrl(userId, jwt);
     const ws = new WebSocket(url);
@@ -69,8 +74,15 @@ export function useWebSocket(userId, jwt) {
     return () => {
       isIntentionalCloseRef.current = true;
       clearTimeout(reconnectTimerRef.current);
-      wsRef.current?.close();
-      wsRef.current = null;
+      if (wsRef.current) {
+        if (wsRef.current.readyState === WebSocket.OPEN) {
+          wsRef.current.close();
+        } else if (wsRef.current.readyState === WebSocket.CONNECTING) {
+          const s = wsRef.current;
+          s.onopen = () => s.close();
+        }
+        wsRef.current = null;
+      }
     };
   }, [connect]);
 
@@ -88,5 +100,12 @@ export function useWebSocket(userId, jwt) {
     delete handlersRef.current[event];
   }, []);
 
-  return { send, on, off, connected };
+  const close = useCallback(() => {
+    isIntentionalCloseRef.current = true;
+    clearTimeout(reconnectTimerRef.current);
+    wsRef.current?.close();
+    wsRef.current = null;
+  }, []);
+
+  return { send, on, off, connected, close };
 }

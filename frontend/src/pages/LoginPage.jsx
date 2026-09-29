@@ -22,6 +22,12 @@ export default function LoginPage() {
     initServerConfig().then(() => setReady(true)).catch(() => setReady(true));
   }, []);
 
+  useEffect(() => {
+    if (auth?.jwt && auth?.keyPair && !auth?.loading) {
+      nav("/chat", { replace: true });
+    }
+  }, [auth, nav]);
+
   const handleLogin = async () => {
     if (!username.trim()) { setError("Enter your username"); return; }
     if (!passphrase) { setError("Enter your passphrase"); return; }
@@ -42,9 +48,11 @@ export default function LoginPage() {
           body: JSON.stringify({ username: username.trim() }),
         });
         if (wrappedRes.ok) {
-          const { wrapped_keys } = await wrappedRes.json();
-          await importWrappedKeysToStorage(wrapped_keys);
+          const { wrapped_keys, public_key } = await wrappedRes.json();
+          await importWrappedKeysToStorage(wrapped_keys, public_key);
           unlocked = await enc.unlock(passphrase);
+        } else if (wrappedRes.status === 404) {
+          throw new Error("No encryption keys found for this account. Please register a new account or log in from your original device.");
         }
       }
 
@@ -63,6 +71,7 @@ export default function LoginPage() {
       }
       const { nonce } = await chalRes.json();
 
+      enc.setKeyPair(unlocked);
       const signedNonce = await enc.sign(nonce);
 
       const verifyRes = await fetch(`${API}/auth/verify`, {
@@ -83,9 +92,14 @@ export default function LoginPage() {
         headers: { Authorization: `Bearer ${token}` },
       });
       const users = await usersRes.json();
-      const me = users.find((u) => u.username === username.trim());
+      const me = users.find(
+        (u) => u.username.toLowerCase() === username.trim().toLowerCase()
+      );
+      if (!me) {
+        throw new Error("User record not found");
+      }
 
-      const keyPair = enc.identity;
+      const keyPair = unlocked || enc.identity;
       setAuth({
         userId: me.id,
         username: me.username,
@@ -98,7 +112,8 @@ export default function LoginPage() {
 
       nav("/chat");
     } catch (e) {
-      setError(e.message);
+      console.error("[LoginPage] Login failed:", e);
+      setError(e.message || "Login failed");
       enc.signOut();
     }
     setLoading(false);

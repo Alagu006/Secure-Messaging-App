@@ -45,10 +45,11 @@ function fileIcon(mime) {
 export default function ChatPage() {
   const { auth, setAuth } = useAuth();
   const nav = useNavigate();
-  const enc = useEncryption();
+  const enc = useEncryption(auth.keyPair);
 
   // ── Core state ──────────────────────────────────────────────────────────
   const [users, setUsers] = useState([]);
+  const [allUsers, setAllUsers] = useState([]);
   const [activeConv, setActiveConv] = useState(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [showNewChat, setShowNewChat] = useState(false);
@@ -98,7 +99,10 @@ export default function ChatPage() {
   const ws = useWebSocket(auth.userId, auth.jwt);
 
   // ── Messages ───────────────────────────────────────────────────────────
-  const msg = useMessages(ws, enc, auth.userId, users, auth.keyPair);
+  const usersForMessages = useMemo(() => {
+    return allUsers.length > 0 ? allUsers : users;
+  }, [allUsers, users]);
+  const msg = useMessages(ws, enc, auth.userId, usersForMessages, auth.keyPair);
 
   // ── Notifications ──────────────────────────────────────────────────────
   const notif = useNotifications();
@@ -118,6 +122,7 @@ export default function ChatPage() {
     })
       .then((r) => r.json())
       .then((data) => {
+        setAllUsers(data);
         const others = data.filter((u) => u.id !== auth.userId);
         setUsers(others);
       })
@@ -373,14 +378,8 @@ export default function ChatPage() {
       const onCreated = (data) => {
         if (sessionKey && data.name === groupName.trim()) {
           enc.setGroupKey(data.id, sessionKey);
-          if (keyBundle) {
-            ws.send("send_message", {
-              group_id: data.id,
-              ciphertext: keyBundle,
-              message_type: "group_key_bundle",
-            });
-          }
         }
+        ws.off("group_created", onCreated);
       };
       ws.on("group_created", onCreated);
 
@@ -1054,7 +1053,9 @@ export default function ChatPage() {
                       onReply={() => setReplyTo(m)}
                       onReact={(emoji) => msg.sendReaction(m.id, emoji)}
                       onEdit={(newText) => {
-                        if (activeUser) {
+                        if (activeGroup) {
+                          msg.editMessage(m.id, activeConv, null, newText);
+                        } else if (activeUser) {
                           msg.editMessage(m.id, activeConv, activeUser.public_key, newText);
                         }
                       }}

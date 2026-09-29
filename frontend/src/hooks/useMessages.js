@@ -69,7 +69,20 @@ export function useMessages(ws, encryption, currentUserId, users, keyPair) {
       // Handle group session key distribution
       if (data.message_type === "group_key_bundle") {
         try {
-          const sender = userMap.current[senderId];
+          let sender = userMap.current[senderId];
+          if (!sender?.public_key) {
+            const token = extractJwt();
+            if (token) {
+              const uRes = await fetch(`${getApiUrl()}/auth/users`, {
+                headers: { Authorization: `Bearer ${token}` },
+              });
+              if (uRes.ok) {
+                const uData = await uRes.json();
+                uData.forEach((u) => { userMap.current[u.id] = u; });
+                sender = userMap.current[senderId];
+              }
+            }
+          }
           if (sender?.public_key && encryption?.unwrapAndStoreGroupKey) {
             await encryption.unwrapAndStoreGroupKey(
               data.group_id,
@@ -402,23 +415,71 @@ export function useMessages(ws, encryption, currentUserId, users, keyPair) {
       // Track whether there are more pages
       hasMoreRef.current[otherUserId] = msgs.length >= 50;
 
-      // If group, unwrap any group key bundles in history first so messages can decrypt
+      // If group, ensure group session key is loaded before decrypting messages
       if (isGroup && encryption?.unwrapAndStoreGroupKey) {
-        for (const m of msgs) {
-          if (m.message_type === "group_key_bundle") {
-            try {
-              const sender = userMap.current[m.sender_id];
+        let groupKey = await encryption.getGroupKey?.(otherUserId);
+        if (!groupKey) {
+          for (const m of msgs) {
+            if (m.message_type === "group_key_bundle") {
+              try {
+                let sender = userMap.current[m.sender_id];
+                if (!sender?.public_key) {
+                  const uRes = await fetch(`${apiBase}/auth/users`, {
+                    headers: { Authorization: `Bearer ${token}` },
+                  });
+                  if (uRes.ok) {
+                    const uList = await uRes.json();
+                    uList.forEach((u) => { userMap.current[u.id] = u; });
+                    sender = userMap.current[m.sender_id];
+                  }
+                }
+                if (sender?.public_key) {
+                  await encryption.unwrapAndStoreGroupKey(
+                    otherUserId,
+                    sender.public_key,
+                    m.ciphertext,
+                    currentUserId
+                  );
+                  groupKey = await encryption.getGroupKey?.(otherUserId);
+                  break;
+                }
+              } catch (err) {
+                console.error("Failed to unwrap group key bundle from history:", err);
+              }
+            }
+          }
+        }
+
+        // If still no group key, fetch from dedicated key-bundle endpoint
+        if (!groupKey) {
+          try {
+            const kbRes = await fetch(`${apiBase}/messages/group/${otherUserId}/key-bundle`, {
+              headers: { Authorization: `Bearer ${token}` },
+            });
+            if (kbRes.ok) {
+              const kbData = await kbRes.json();
+              let sender = userMap.current[kbData.sender_id];
+              if (!sender?.public_key) {
+                const uRes = await fetch(`${apiBase}/auth/users`, {
+                  headers: { Authorization: `Bearer ${token}` },
+                });
+                if (uRes.ok) {
+                  const uList = await uRes.json();
+                  uList.forEach((u) => { userMap.current[u.id] = u; });
+                  sender = userMap.current[kbData.sender_id];
+                }
+              }
               if (sender?.public_key) {
                 await encryption.unwrapAndStoreGroupKey(
                   otherUserId,
                   sender.public_key,
-                  m.ciphertext,
+                  kbData.key_bundle,
                   currentUserId
                 );
               }
-            } catch (err) {
-              console.error("Failed to unwrap group key bundle from history:", err);
             }
+          } catch (err) {
+            console.warn("Failed to fetch dedicated group key bundle:", err);
           }
         }
       }
@@ -442,7 +503,19 @@ export function useMessages(ws, encryption, currentUserId, users, keyPair) {
             }
           }
         } else {
-          const otherUser = userMap.current[otherUserId];
+          let otherUser = userMap.current[otherUserId];
+          if (!otherUser) {
+            try {
+              const uRes = await fetch(`${apiBase}/auth/users`, {
+                headers: { Authorization: `Bearer ${token}` },
+              });
+              if (uRes.ok) {
+                const uList = await uRes.json();
+                uList.forEach((u) => { userMap.current[u.id] = u; });
+                otherUser = userMap.current[otherUserId];
+              }
+            } catch {}
+          }
           if (otherUser && encryption && m.ciphertext && !m.is_deleted) {
             try {
               const { iv, ciphertext } = unbundle(m.ciphertext);
@@ -491,26 +564,28 @@ export function useMessages(ws, encryption, currentUserId, users, keyPair) {
       }
 
       const convId = otherUserId;
-      if (!beforeId) {
-        // Initial fetch: prepend new messages to existing ones
-        const existing = messagesByConvRef.current[convId] || [];
-        const existingIds = new Set(existing.map((e) => e.id));
-        const newMsgs = decrypted.filter((d) => !existingIds.has(d.id));
-        if (newMsgs.length > 0) {
-          messagesByConvRef.current[convId] = [...newMsgs, ...existing];
-          setMessagesByConv({ ...messagesByConvRef.current });
-          // Cache the merged result
-          cacheMessages(convId, messagesByConvRef.current[convId]);
+      const existing = messagesByConvRef.current[convId] || [];
+      const existingMap = new Map(existing.map((e) => [e.id, e]));
+      let hasChanges = false;
+
+      for (const d of decrypted) {
+        const prev = existingMap.get(d.id);
+        if (!prev) {
+          existingMap.set(d.id, d);
+          hasChanges = true;
+        } else if (prev.decryptFailed && !d.decryptFailed) {
+          existingMap.set(d.id, d);
+          hasChanges = true;
         }
-      } else {
-        // Pagination: prepend older messages
-        const existing = messagesByConvRef.current[convId] || [];
-        const existingIds = new Set(existing.map((e) => e.id));
-        const newMsgs = decrypted.filter((d) => !existingIds.has(d.id));
-        if (newMsgs.length > 0) {
-          messagesByConvRef.current[convId] = [...newMsgs, ...existing];
-          setMessagesByConv({ ...messagesByConvRef.current });
-        }
+      }
+
+      if (hasChanges || !beforeId) {
+        const merged = Array.from(existingMap.values()).sort(
+          (a, b) => new Date(a.createdAt) - new Date(b.createdAt)
+        );
+        messagesByConvRef.current[convId] = merged;
+        setMessagesByConv({ ...messagesByConvRef.current });
+        cacheMessages(convId, merged);
       }
     } catch {
       // silently fail
@@ -640,19 +715,27 @@ export function useMessages(ws, encryption, currentUserId, users, keyPair) {
     async (messageId, recipientId, recipientPublicKey, newText) => {
       if (!encryption || !ws) return;
       try {
-        const { iv, ciphertext } = await encryption.encrypt(
-          recipientPublicKey,
-          newText
-        );
+        const isGroup = conversations.find((c) => c.userId === recipientId)?.isGroup || false;
+        let bundledCiphertext;
+        if (isGroup) {
+          const { iv, ciphertext } = await encryption.encryptGroup(recipientId, newText);
+          bundledCiphertext = bundle(iv, ciphertext);
+        } else {
+          const { iv, ciphertext } = await encryption.encrypt(
+            recipientPublicKey,
+            newText
+          );
+          bundledCiphertext = bundle(iv, ciphertext);
+        }
         ws.send("message_edit", {
           message_id: messageId,
-          ciphertext: bundle(iv, ciphertext),
+          ciphertext: bundledCiphertext,
         });
       } catch (err) {
         console.error("Re-encryption failed:", err);
       }
     },
-    [encryption, ws]
+    [encryption, ws, conversations]
   );
 
   const deleteMessage = useCallback(

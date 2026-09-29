@@ -155,7 +155,7 @@ class ConnectionManager:
             user_ids = [str(r["user_id"]) for r in rows]
             if recipient_id and recipient_id not in user_ids:
                 user_ids.append(recipient_id)
-            return user_ids
+            return list(set(user_ids + [sender_id]))
         else:
             # Direct message — sender + recipient
             users = {sender_id}
@@ -362,8 +362,8 @@ class ConnectionManager:
                 reader_id,
             )
 
-        # Notify the other user (the original sender)
-        await self.send_personal(other_user_id, {
+        # Notify conversation participants (including sender)
+        await self.broadcast_to_users(participants, {
             "event": "read_receipt",
             "data": {
                 "message_id": message_id,

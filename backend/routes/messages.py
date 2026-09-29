@@ -127,6 +127,40 @@ async def get_group_messages(
     return result
 
 
+@router.get("/group/{group_id}/key-bundle")
+async def get_group_key_bundle(
+    group_id: str,
+    user_id: str = Depends(get_current_user),
+):
+    """Return the most recent group key bundle for a group if caller is a member."""
+    async with database.pool.acquire() as conn:
+        member = await conn.fetchrow(
+            "SELECT 1 FROM group_members WHERE group_id = $1::uuid AND user_id = $2::uuid",
+            group_id, user_id,
+        )
+        if not member:
+            raise HTTPException(status_code=403, detail="Not a group member")
+
+        row = await conn.fetchrow(
+            """
+            SELECT id, sender_id, ciphertext, created_at
+            FROM messages
+            WHERE group_id = $1::uuid AND message_type = 'group_key_bundle'
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            group_id,
+        )
+    if not row:
+        raise HTTPException(status_code=404, detail="No group key bundle found")
+    return {
+        "id": str(row["id"]),
+        "sender_id": str(row["sender_id"]),
+        "key_bundle": row["ciphertext"],
+        "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+    }
+
+
 @router.get("/{other_user_id}")
 async def get_conversation_messages(
     other_user_id: str,

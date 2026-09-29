@@ -1,5 +1,3 @@
-git add .
-git commit -m "Initial Commit (Cleaned)"
 import { useRef } from "react";
 
 export default function FileAttachment({ onAttach }) {

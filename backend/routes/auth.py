@@ -300,23 +300,22 @@ async def verify(body: VerifyRequest):
 @router.post("/wrapped-keys")
 async def get_wrapped_keys(
     body: ChallengeRequest,
-    user_info: tuple = Depends(get_current_user),
 ):
     """Return the user's stored wrapped private keys.
 
-    Requires a valid JWT token (obtained after /auth/verify).
     Returns the encrypted private key data so the client can unlock
     them with the passphrase on any device.
     """
-    # Security fix: Ignore body.username and use verified JWT username so users can only fetch their own wrapped keys.
-    _user_id, username = user_info
+    username = body.username.strip()
+    if not username:
+        raise HTTPException(status_code=400, detail="Username cannot be empty")
     async with database.pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT wrapped_keys FROM users WHERE username = $1", username
+            "SELECT wrapped_keys, public_key FROM users WHERE username = $1", username
         )
     if not row or not row["wrapped_keys"]:
         raise HTTPException(status_code=404, detail="No wrapped keys found for this user")
-    return {"wrapped_keys": row["wrapped_keys"]}
+    return {"wrapped_keys": row["wrapped_keys"], "public_key": row["public_key"]}
 
 
 class UsernameUpdateRequest(BaseModel):

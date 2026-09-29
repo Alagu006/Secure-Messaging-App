@@ -472,14 +472,27 @@ export async function exportWrappedKeysFromStorage() {
     wrappedSigning: Array.from(new Uint8Array(record.wrappedSigning)),
     wrapIV: Array.from(new Uint8Array(record.wrapIV)),
     salt: Array.from(new Uint8Array(record.salt)),
+    publicKeyAgreementJwk: record.publicKeyAgreementJwk || null,
+    publicSigningJwk: record.publicSigningJwk || null,
   };
   return btoa(JSON.stringify(data));
 }
 
-export async function importWrappedKeysToStorage(wrappedKeysB64) {
+export async function importWrappedKeysToStorage(wrappedKeysB64, publicKeyB64 = null) {
   /* Import wrapped private keys from server and store in IndexedDB.
      Used on a new device to restore keys after login. */
   const data = JSON.parse(atob(wrappedKeysB64));
+  let kaJwk = data.publicKeyAgreementJwk || null;
+  let sgJwk = data.publicSigningJwk || null;
+
+  if ((!kaJwk || !sgJwk) && publicKeyB64) {
+    try {
+      const parsedPk = JSON.parse(atob(publicKeyB64));
+      kaJwk = kaJwk || parsedPk.ka || null;
+      sgJwk = sgJwk || parsedPk.sg || null;
+    } catch {}
+  }
+
   const db = await openKeyDB();
   const tx = db.transaction(STORE_NAME, "readwrite");
   const store = tx.objectStore(STORE_NAME);
@@ -490,6 +503,8 @@ export async function importWrappedKeysToStorage(wrappedKeysB64) {
       wrappedSigning: new Uint8Array(data.wrappedSigning),
       wrapIV: new Uint8Array(data.wrapIV),
       salt: new Uint8Array(data.salt),
+      publicKeyAgreementJwk: kaJwk,
+      publicSigningJwk: sgJwk,
     });
     req.onsuccess = () => resolve();
     req.onerror = () => reject(req.error);
@@ -709,21 +724,35 @@ export async function loadKeysFromStorage(passphrase) {
   );
 
   // ---- Reimport the public keys from stored JWK ----
-  const kaPublicKey = await crypto.subtle.importKey(
-    "jwk",
-    record.publicKeyAgreementJwk,
-    ECDH_PARAMS,
-    true,
-    []
-  );
+  let kaPublicKey = null;
+  if (record.publicKeyAgreementJwk) {
+    try {
+      kaPublicKey = await crypto.subtle.importKey(
+        "jwk",
+        record.publicKeyAgreementJwk,
+        ECDH_PARAMS,
+        true,
+        []
+      );
+    } catch (e) {
+      console.warn("Failed to import kaPublicKey:", e);
+    }
+  }
 
-  const sgPublicKey = await crypto.subtle.importKey(
-    "jwk",
-    record.publicSigningJwk,
-    ECDSA_PARAMS,
-    true,
-    []
-  );
+  let sgPublicKey = null;
+  if (record.publicSigningJwk) {
+    try {
+      sgPublicKey = await crypto.subtle.importKey(
+        "jwk",
+        record.publicSigningJwk,
+        ECDSA_PARAMS,
+        true,
+        []
+      );
+    } catch (e) {
+      console.warn("Failed to import sgPublicKey:", e);
+    }
+  }
 
   return {
     keyAgreement: {
@@ -900,7 +929,7 @@ async function deriveWrappingKey(passphrase, salt) {
 
 function openKeyDB() {
   /*
-    Open (or create) the IndexedDB database that holds our wrapped keys.
+    Open (or create) the IndexedDB database that holds our wrapped keys and group keys.
 
     IndexedDB is a key-value store built into every browser — like a
     small local database. We use it here because CryptoKey objects cannot
@@ -908,7 +937,7 @@ function openKeyDB() {
   */
 
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open(DB_NAME, 2);
+    const request = indexedDB.open(DB_NAME, 3);
 
     // Create the object store if it doesn't already exist
     request.onupgradeneeded = (event) => {
@@ -916,11 +945,47 @@ function openKeyDB() {
       if (!db.objectStoreNames.contains(STORE_NAME)) {
         db.createObjectStore(STORE_NAME, { keyPath: "id" });
       }
+      if (!db.objectStoreNames.contains("group_keys")) {
+        db.createObjectStore("group_keys", { keyPath: "groupId" });
+      }
     };
 
     request.onsuccess = (event) => resolve(event.target.result);
     request.onerror = () => reject(request.error);
   });
+}
+
+export async function saveGroupKeyToStorage(groupId, rawKeyB64) {
+  try {
+    const db = await openKeyDB();
+    const tx = db.transaction("group_keys", "readwrite");
+    const store = tx.objectStore("group_keys");
+    await new Promise((resolve, reject) => {
+      const req = store.put({ groupId, rawKeyB64, updatedAt: Date.now() });
+      req.onsuccess = () => resolve();
+      req.onerror = () => reject(req.error);
+    });
+    db.close();
+  } catch (e) {
+    console.warn("Failed to persist group key in storage:", e);
+  }
+}
+
+export async function loadGroupKeyFromStorage(groupId) {
+  try {
+    const db = await openKeyDB();
+    const tx = db.transaction("group_keys", "readonly");
+    const store = tx.objectStore("group_keys");
+    const rec = await new Promise((resolve, reject) => {
+      const req = store.get(groupId);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+    db.close();
+    return rec ? rec.rawKeyB64 : null;
+  } catch (e) {
+    return null;
+  }
 }
 
 
@@ -1027,7 +1092,9 @@ export async function createGroupKeyBundle(myPrivateKey, memberList) {
 
 export async function unwrapGroupKeyBundle(myPrivateKey, creatorPublicKeyB64, bundleData, myUserId) {
   const bundle = typeof bundleData === "string" ? JSON.parse(bundleData) : bundleData;
-  const myEntry = bundle[myUserId];
+  const myEntry = bundle[myUserId] ||
+    bundle[String(myUserId).toLowerCase()] ||
+    Object.entries(bundle).find(([k]) => k.toLowerCase() === String(myUserId).toLowerCase())?.[1];
   if (!myEntry) {
     throw new Error("No wrapped key for this user in group key bundle");
   }

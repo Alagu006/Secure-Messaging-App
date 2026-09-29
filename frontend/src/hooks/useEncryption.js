@@ -18,16 +18,32 @@ import {
   importRawGroupKey,
   encryptGroupMessage,
   decryptGroupMessage,
+  saveGroupKeyToStorage,
+  loadGroupKeyFromStorage,
+  arrayBufferToBase64,
 } from "../utils/crypto";
 
-export function useEncryption() {
-  const [identity, setIdentity] = useState(null);
+export function useEncryption(initialKeyPair = null) {
+  const [identity, setIdentity] = useState(initialKeyPair);
   const sharedKeysRef = useRef({}); // cache: { userId: sharedKey }
   const groupKeysRef = useRef({}); // cache: { groupId: groupSessionKey }
-  const identityRef = useRef(null); // synchronous mirror of identity
+  const identityRef = useRef(initialKeyPair); // synchronous mirror of identity
 
-  function getIdentity() {
-    return identityRef.current || identity;
+  async function getIdentity() {
+    if (identityRef.current) return identityRef.current;
+    if (identity) return identity;
+    const passphrase = getCachedPassphrase();
+    if (passphrase) {
+      try {
+        const keyPair = await loadKeysFromStorage(passphrase);
+        if (keyPair) {
+          identityRef.current = keyPair;
+          setIdentity(keyPair);
+          return keyPair;
+        }
+      } catch {}
+    }
+    return null;
   }
 
   const generateAndStore = useCallback(async (passphrase) => {
@@ -39,17 +55,21 @@ export function useEncryption() {
   }, []);
 
   const unlock = useCallback(async (passphrase) => {
-    const keyPair = await loadKeysFromStorage(passphrase);
-    if (keyPair) {
-      identityRef.current = keyPair;
-      setIdentity(keyPair);
+    try {
+      const keyPair = await loadKeysFromStorage(passphrase);
+      if (keyPair) {
+        identityRef.current = keyPair;
+        setIdentity(keyPair);
+      }
+      return keyPair;
+    } catch {
+      return null;
     }
-    return keyPair;
   }, []);
 
   const getSharedKey = useCallback(
     async (theirPublicKeyB64) => {
-      const id = getIdentity();
+      const id = await getIdentity();
       if (!id) return null;
       const cacheKey = theirPublicKeyB64;
       if (sharedKeysRef.current[cacheKey]) return sharedKeysRef.current[cacheKey];
@@ -103,7 +123,7 @@ export function useEncryption() {
 
   const sign = useCallback(
     async (nonce) => {
-      const id = getIdentity();
+      const id = await getIdentity();
       if (!id) throw new Error("No identity — unlock first");
       return signChallenge(id.signing.privateKey, nonce);
     },
@@ -111,7 +131,7 @@ export function useEncryption() {
   );
 
   const exportKeys = useCallback(async () => {
-    const id = getIdentity();
+    const id = await getIdentity();
     if (!id) return null;
     return exportPublicKey(
       id.keyAgreement.publicKey,
@@ -138,21 +158,38 @@ export function useEncryption() {
   }, []);
 
   const generateGroupBundle = useCallback(async (memberList) => {
-    const id = getIdentity();
+    const id = await getIdentity();
     if (!id) throw new Error("No identity — unlock first");
     return createGroupKeyBundle(id.keyAgreement.privateKey, memberList);
   }, []);
 
-  const setGroupKey = useCallback((groupId, key) => {
+  const setGroupKey = useCallback(async (groupId, key, rawKeyB64 = null) => {
     groupKeysRef.current[groupId] = key;
+    if (rawKeyB64) {
+      await saveGroupKeyToStorage(groupId, rawKeyB64);
+    } else {
+      try {
+        const raw = await crypto.subtle.exportKey("raw", key);
+        await saveGroupKeyToStorage(groupId, arrayBufferToBase64(raw));
+      } catch {}
+    }
   }, []);
 
-  const getGroupKey = useCallback((groupId) => {
-    return groupKeysRef.current[groupId] || null;
+  const getGroupKey = useCallback(async (groupId) => {
+    if (groupKeysRef.current[groupId]) return groupKeysRef.current[groupId];
+    const savedRaw = await loadGroupKeyFromStorage(groupId);
+    if (savedRaw) {
+      try {
+        const key = await importRawGroupKey(savedRaw);
+        groupKeysRef.current[groupId] = key;
+        return key;
+      } catch {}
+    }
+    return null;
   }, []);
 
   const unwrapAndStoreGroupKey = useCallback(async (groupId, creatorPublicKeyB64, bundleData, myUserId) => {
-    const id = getIdentity();
+    const id = await getIdentity();
     if (!id) throw new Error("No identity — unlock first");
     const key = await unwrapGroupKeyBundle(
       id.keyAgreement.privateKey,
@@ -161,20 +198,24 @@ export function useEncryption() {
       myUserId
     );
     groupKeysRef.current[groupId] = key;
+    try {
+      const raw = await crypto.subtle.exportKey("raw", key);
+      await saveGroupKeyToStorage(groupId, arrayBufferToBase64(raw));
+    } catch {}
     return key;
   }, []);
 
   const encryptGroup = useCallback(async (groupId, plaintext) => {
-    const key = groupKeysRef.current[groupId];
+    let key = groupKeysRef.current[groupId] || (await getGroupKey(groupId));
     if (!key) throw new Error(`No group key found for group ${groupId}`);
     return encryptGroupMessage(key, plaintext);
-  }, []);
+  }, [getGroupKey]);
 
   const decryptGroup = useCallback(async (groupId, iv, ciphertext) => {
-    const key = groupKeysRef.current[groupId];
+    let key = groupKeysRef.current[groupId] || (await getGroupKey(groupId));
     if (!key) throw new Error(`No group key found for group ${groupId}`);
     return decryptGroupMessage(key, iv, ciphertext);
-  }, []);
+  }, [getGroupKey]);
 
   const signOut = useCallback(() => {
     identityRef.current = null;

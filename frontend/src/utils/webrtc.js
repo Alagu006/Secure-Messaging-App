@@ -32,12 +32,12 @@ import { arrayBufferToBase64, base64ToArrayBuffer } from "./crypto";
 const CHUNK_SIZE = 64 * 1024; // 64 KB per chunk
 
 // Configurable ICE servers with fallback for isolated/air-gapped LANs
-let currentIceServers = [
-  { urls: import.meta.env.VITE_STUN_SERVER || "stun:stun.l.google.com:19302" },
+export let ICE_SERVERS = [
+  { urls: (typeof import.meta !== "undefined" && import.meta.env?.VITE_STUN_SERVER) || "stun:stun.l.google.com:19302" },
 ];
 
-if (import.meta.env.VITE_OFFLINE_MODE === "true" || import.meta.env.VITE_OFFLINE_MODE === "1") {
-  currentIceServers = [];
+if (typeof import.meta !== "undefined" && (import.meta.env?.VITE_OFFLINE_MODE === "true" || import.meta.env?.VITE_OFFLINE_MODE === "1")) {
+  ICE_SERVERS = [];
 } else if (typeof window !== "undefined" && typeof fetch === "function") {
   // Reachability check on startup: if internet/STUN host is unreachable within 2s, fall back to host-only
   try {
@@ -46,15 +46,15 @@ if (import.meta.env.VITE_OFFLINE_MODE === "true" || import.meta.env.VITE_OFFLINE
     fetch("https://www.google.com/generate_204", { mode: "no-cors", signal: controller.signal })
       .then(() => clearTimeout(timeoutId))
       .catch(() => {
-        currentIceServers = [];
+        ICE_SERVERS = [];
       });
   } catch {
-    currentIceServers = [];
+    ICE_SERVERS = [];
   }
 }
 
 export function getIceServers() {
-  return currentIceServers;
+  return ICE_SERVERS;
 }
 
 // ── 1. createPeerConnection() ────────────────────────────────────────────

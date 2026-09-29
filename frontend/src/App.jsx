@@ -114,7 +114,11 @@ export default function App() {
             <Route
               path="*"
               element={
-                <Navigate to={hasKeys ? "/login" : "/setup"} replace />
+                auth.jwt && auth.keyPair ? (
+                  <Navigate to="/chat" replace />
+                ) : (
+                  <Navigate to={hasKeys ? "/login" : "/setup"} replace />
+                )
               }
             />
           </Routes>
