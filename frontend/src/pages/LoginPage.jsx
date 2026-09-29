@@ -8,7 +8,7 @@ import { getCachedPassphrase } from "../utils/crypto";
 import ServerConnect from "../components/ServerConnect";
 
 export default function LoginPage() {
-  const { setAuth } = useAuth();
+  const { auth, setAuth } = useAuth();
   const nav = useNavigate();
   const enc = useEncryption();
 
